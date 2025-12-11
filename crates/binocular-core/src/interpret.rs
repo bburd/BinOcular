@@ -274,6 +274,24 @@ mod tests {
     }
 
     #[test]
+    fn field_endianness_overrides_schema_endianness() {
+        let buffer = MemoryBuffer::from_vec(vec![0x01, 0x02]);
+
+        let schema = Schema {
+            schema_name: "precedence".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Big),
+            fields: vec![],
+        };
+
+        let field = make_field("u16", FieldType::U16, 0, Some(Endianness::Little));
+
+        let value = interpret_field(&buffer, &field, Some(&schema)).unwrap();
+
+        assert_uint(value, 0x0201);
+    }
+
+    #[test]
     fn interprets_with_default_little_endian() {
         let buffer = MemoryBuffer::from_vec(vec![
             0x10, // U8
