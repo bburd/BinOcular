@@ -1,0 +1,53 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Schema {
+    pub schema_name: String,
+    pub schema_version: u32,
+    pub endianness: Option<Endianness>,
+    pub fields: Vec<FieldDef>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Endianness {
+    Little,
+    Big,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value")]
+pub enum OffsetKind {
+    Absolute(u64),
+    Expr(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldType {
+    U8,
+    U16,
+    U32,
+    U64,
+    I32,
+    F32,
+    Bytes,
+    Ascii,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepeatInfo {
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldDef {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: FieldType,
+    pub offset: OffsetKind,
+    pub length: Option<u64>,
+    pub endianness: Option<Endianness>,
+    pub description: Option<String>,
+    pub repeat: Option<RepeatInfo>,
+}

@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/binocular-core",
+    "crates/binocular-schema",
+    "crates/binocular-cli",
+    "crates/binocular-gui",
+]
+
+resolver = "2"
