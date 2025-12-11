@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut results = Vec::new();
     for field in &schema.fields {
-        let value = interpret_field(&buffer, field);
+        let value = interpret_field(&buffer, field, Some(&schema));
         results.push((field.name.clone(), value));
     }
 
