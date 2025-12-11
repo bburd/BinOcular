@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         records.push(FieldRecord {
             name: field.name.clone(),
             offset,
-            offset_hex: offset.map(|o| format!("0x{o:X}")),
+            offset_hex: offset.map(|o| format!("0x{o:08X}")),
             field_type: render_field_type(field),
             value,
             error,
@@ -109,7 +109,7 @@ struct FieldRecord {
 
 fn render_offset(offset: Option<u64>) -> String {
     match offset {
-        Some(value) => format!("{} (0x{:X})", value, value),
+        Some(value) => format!("{} (0x{value:08X})", value),
         None => "-".to_string(),
     }
 }
