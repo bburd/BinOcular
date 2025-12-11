@@ -7,4 +7,4 @@ edition = "2021"
 eframe = "0.27"
 binocular-core = { path = "../binocular-core" }
 binocular-schema = { path = "../binocular-schema" }
-rfd = "0.14"
+rfd = "0.14.1"
