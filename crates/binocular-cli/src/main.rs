@@ -156,7 +156,13 @@ fn render_bytes(bytes: &[u8]) -> String {
         rendered.push("…".to_string());
     }
 
-    rendered.join(" ")
+    let rendered = rendered.join(" ");
+
+    if bytes.len() > MAX_BYTES {
+        format!("{rendered} (len={})", bytes.len())
+    } else {
+        rendered
+    }
 }
 
 fn render_ascii(text: &str) -> String {
