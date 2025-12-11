@@ -1,13 +1,15 @@
 use std::{fs, path::PathBuf};
 
-use binocular_core::buffer::MemoryBuffer;
+use binocular_core::buffer::{FileBuffer, MemoryBuffer};
 use eframe::egui;
+
+const MAX_HEX_BYTES: usize = 256;
 
 struct Document {
     path: PathBuf,
     name: String,
     size: u64,
-    _buffer: MemoryBuffer,
+    buffer: MemoryBuffer,
 }
 
 struct BinOcularApp {
@@ -55,8 +57,53 @@ impl BinOcularApp {
             path,
             name,
             size,
-            _buffer: buffer,
+            buffer,
         })
+    }
+}
+
+impl Document {
+    fn read_bytes(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        self.buffer.read_bytes(offset, len).ok()
+    }
+}
+
+fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
+    const BYTES_PER_ROW: usize = 16;
+    let to_show = doc.size.min(MAX_HEX_BYTES as u64) as usize;
+
+    if to_show == 0 {
+        ui.label("File is empty.");
+        return;
+    }
+
+    let Some(bytes) = doc.read_bytes(0, to_show) else {
+        ui.label("Failed to read file data.");
+        return;
+    };
+
+    for row_start in (0..bytes.len()).step_by(BYTES_PER_ROW) {
+        let row_end = (row_start + BYTES_PER_ROW).min(bytes.len());
+        let row = &bytes[row_start..row_end];
+
+        let mut hex_column = String::new();
+        let mut ascii_column = String::new();
+
+        for i in 0..BYTES_PER_ROW {
+            if let Some(byte) = row.get(i) {
+                hex_column.push_str(&format!("{:02X} ", byte));
+                let ch = if (0x20..=0x7E).contains(byte) {
+                    *byte as char
+                } else {
+                    '.'
+                };
+                ascii_column.push(ch);
+            } else {
+                hex_column.push_str("   ");
+            }
+        }
+
+        ui.monospace(format!("{:08X}: {} {}", row_start, hex_column, ascii_column));
     }
 }
 
@@ -79,7 +126,7 @@ impl eframe::App for BinOcularApp {
                     ui.heading(&doc.name);
                     ui.label(format!("Size: {}", format_size(doc.size)));
                     ui.separator();
-                    ui.label("Hex view coming soon…");
+                    draw_hex_view(ui, doc);
                     return;
                 }
             }
