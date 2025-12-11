@@ -7,6 +7,7 @@ use binocular_core::interpret::{interpret_field, FieldValue};
 use binocular_schema::ast::{FieldDef, FieldType, OffsetKind};
 use binocular_schema::parser::parse_schema_str;
 use clap::Parser;
+use serde_json::json;
 
 #[derive(Parser)]
 #[command(name = "binocular-cli")]
@@ -48,7 +49,7 @@ fn main() -> anyhow::Result<()> {
 
         let result = interpret_field(&buffer, field, Some(&schema));
         let (value, error) = match result {
-            Ok(value) => (Some(render_field_value(&value)), None),
+            Ok(value) => (Some(value), None),
             Err(err) => (None, Some(err.to_string())),
         };
 
@@ -63,8 +64,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     if cli.json {
-        use serde_json::json;
-
         let json_records: Vec<_> = records
             .into_iter()
             .map(|record| {
@@ -73,7 +72,7 @@ fn main() -> anyhow::Result<()> {
                     "offset": record.offset,
                     "offset_hex": record.offset_hex,
                     "type": record.field_type,
-                    "value": record.value,
+                    "value": render_json_value(record.value),
                     "error": record.error,
                 })
             })
@@ -84,7 +83,7 @@ fn main() -> anyhow::Result<()> {
         println!("NAME|OFFSET|TYPE|VALUE|ERROR");
         for record in records {
             let offset = render_offset(record.offset);
-            let value = record.value.unwrap_or_else(|| "-".to_string());
+            let value = render_table_value(record.value.as_ref());
             let error = record.error.unwrap_or_else(|| "-".to_string());
 
             println!(
@@ -103,7 +102,7 @@ struct FieldRecord {
     offset: Option<u64>,
     offset_hex: Option<String>,
     field_type: String,
-    value: Option<String>,
+    value: Option<FieldValue>,
     error: Option<String>,
 }
 
@@ -133,6 +132,12 @@ fn render_field_type(field: &FieldDef) -> String {
     }
 }
 
+fn render_table_value(value: Option<&FieldValue>) -> String {
+    value
+        .map(render_field_value)
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn render_field_value(value: &FieldValue) -> String {
     match value {
         FieldValue::UInt(v) => format!("{} (0x{:X})", v, v),
@@ -140,6 +145,17 @@ fn render_field_value(value: &FieldValue) -> String {
         FieldValue::Float(v) => format!("{}", v),
         FieldValue::Bytes(bytes) => render_bytes(bytes),
         FieldValue::Ascii(text) => render_ascii(text),
+    }
+}
+
+fn render_json_value(value: Option<FieldValue>) -> serde_json::Value {
+    match value {
+        Some(FieldValue::UInt(v)) => json!(v),
+        Some(FieldValue::Int(v)) => json!(v),
+        Some(FieldValue::Float(v)) => json!(v),
+        Some(FieldValue::Bytes(bytes)) => json!(render_bytes(&bytes)),
+        Some(FieldValue::Ascii(text)) => json!(render_ascii(&text)),
+        None => serde_json::Value::Null,
     }
 }
 
