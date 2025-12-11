@@ -1,13 +1,121 @@
+use std::{fs, path::PathBuf};
+
+use binocular_core::buffer::MemoryBuffer;
 use eframe::egui;
 
-struct BinOcularApp;
+struct Document {
+    path: PathBuf,
+    name: String,
+    size: u64,
+    _buffer: MemoryBuffer,
+}
+
+struct BinOcularApp {
+    documents: Vec<Document>,
+    current_doc: Option<usize>,
+}
+
+impl BinOcularApp {
+    fn new() -> Self {
+        Self {
+            documents: Vec::new(),
+            current_doc: None,
+        }
+    }
+
+    fn open_document_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_file() {
+            match Self::load_document_from_path(path) {
+                Ok(document) => {
+                    self.current_doc = Some(self.documents.len());
+                    self.documents.push(document);
+                }
+                Err(err) => {
+                    eprintln!("Failed to open file: {err}");
+                }
+            }
+        }
+    }
+
+    fn load_document_from_path(path: PathBuf) -> Result<Document, String> {
+        let metadata = fs::metadata(&path).map_err(|err| err.to_string())?;
+        if !metadata.is_file() {
+            return Err("Selected path is not a file".to_string());
+        }
+
+        let size = metadata.len();
+        let data = fs::read(&path).map_err(|err| err.to_string())?;
+        let buffer = MemoryBuffer::from_vec(data);
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+
+        Ok(Document {
+            path,
+            name,
+            size,
+            _buffer: buffer,
+        })
+    }
+}
 
 impl eframe::App for BinOcularApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("BinOcular");
-            ui.label("GUI scaffold is running.");
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open...").clicked() {
+                        ui.close_menu();
+                        self.open_document_dialog();
+                    }
+                });
+            });
         });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(index) = self.current_doc {
+                if let Some(doc) = self.documents.get(index) {
+                    ui.heading(&doc.name);
+                    ui.label(format!("Size: {}", format_size(doc.size)));
+                    ui.separator();
+                    ui.label("Hex view coming soon…");
+                    return;
+                }
+            }
+
+            ui.heading("Welcome to BinOcular");
+            ui.label("Open a file to get started.");
+        });
+
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            let status_left = self
+                .current_doc
+                .and_then(|index| self.documents.get(index))
+                .map(|doc| doc.name.clone())
+                .unwrap_or_else(|| "No file open".to_string());
+
+            ui.with_layout(
+                egui::Layout::left_to_right(egui::Align::Center).with_main_justify(true),
+                |ui| {
+                    ui.label(status_left);
+                    ui.label("BinOcular pre-alpha");
+                },
+            );
+        });
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+
+    if bytes >= MB as u64 {
+        format!("{:.2} MB", bytes as f64 / MB)
+    } else if bytes >= KB as u64 {
+        format!("{:.2} KB", bytes as f64 / KB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -16,6 +124,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "BinOcular",
         options,
-        Box::new(|_cc| Box::new(BinOcularApp)),
+        Box::new(|_cc| Box::new(BinOcularApp::new())),
     )
 }
