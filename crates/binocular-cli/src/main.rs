@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process;
 
 use binocular_core::buffer::MemoryBuffer;
-use binocular_core::interpret::{interpret_field, FieldValue};
+use binocular_core::interpret::{interpret_schema, FieldValue};
 use binocular_schema::ast::{FieldDef, FieldType, OffsetKind};
 use binocular_schema::parser::parse_schema_str;
 use clap::Parser;
@@ -40,28 +40,25 @@ fn main() -> anyhow::Result<()> {
 
     let buffer = MemoryBuffer::from_vec(file_bytes);
 
-    let mut records = Vec::new();
-    for field in &schema.fields {
-        let offset = match &field.offset {
-            OffsetKind::Absolute(o) => Some(*o),
-            OffsetKind::Expr(_) => None,
-        };
+    let evaluations = interpret_schema(&buffer, &schema);
+    let records: Vec<_> = evaluations
+        .into_iter()
+        .map(|eval| {
+            let offset = match &eval.field.offset {
+                OffsetKind::Absolute(o) => Some(*o),
+                OffsetKind::Expr(_) => None,
+            };
 
-        let result = interpret_field(&buffer, field, Some(&schema));
-        let (value, error) = match result {
-            Ok(value) => (Some(value), None),
-            Err(err) => (None, Some(err.to_string())),
-        };
-
-        records.push(FieldRecord {
-            name: field.name.clone(),
-            offset,
-            offset_hex: offset.map(|o| format!("0x{o:08X}")),
-            field_type: render_field_type(field),
-            value,
-            error,
-        });
-    }
+            FieldRecord {
+                name: eval.field.name.clone(),
+                offset,
+                offset_hex: offset.map(|o| format!("0x{o:08X}")),
+                field_type: render_field_type(&eval.field),
+                value: eval.value,
+                error: eval.error,
+            }
+        })
+        .collect();
 
     if cli.json {
         let json_records: Vec<_> = records
