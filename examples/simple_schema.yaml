@@ -1,0 +1,25 @@
+schema_name: "Simple Example"
+schema_version: 1
+endianness: little
+fields:
+  - name: magic
+    type: u32
+    offset:
+      kind: Absolute
+      value: 0
+  - name: answer
+    type: i32
+    offset:
+      kind: Absolute
+      value: 4
+  - name: value
+    type: f32
+    offset:
+      kind: Absolute
+      value: 8
+  - name: status
+    type: ascii
+    offset:
+      kind: Absolute
+      value: 12
+    length: 4
