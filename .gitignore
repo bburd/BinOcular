@@ -1,0 +1,36 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+
+# Cargo package files
+Cargo.lock
+# If building a library, you may keep Cargo.lock; leave ignored for binaries.
+
+# IDE/Editor Stuff
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs & Dumps
+*.log
+*.dmp
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Binary Outputs
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build Artifacts
+build/
+dist/
+
+# Temporary Files
+tmp/
+temp/
+*.tmp
