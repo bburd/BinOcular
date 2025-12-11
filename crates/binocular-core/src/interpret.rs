@@ -11,6 +11,13 @@ pub enum FieldValue {
     Ascii(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct FieldEval {
+    pub field: FieldDef,
+    pub value: Option<FieldValue>,
+    pub error: Option<String>,
+}
+
 pub fn interpret_field<B: FileBuffer>(
     buffer: &B,
     field: &FieldDef,
@@ -66,6 +73,25 @@ pub fn interpret_field<B: FileBuffer>(
     };
 
     Ok(value)
+}
+
+pub fn interpret_schema<B: FileBuffer>(buffer: &B, schema: &Schema) -> Vec<FieldEval> {
+    schema
+        .fields
+        .iter()
+        .map(|field| match interpret_field(buffer, field, Some(schema)) {
+            Ok(value) => FieldEval {
+                field: field.clone(),
+                value: Some(value),
+                error: None,
+            },
+            Err(err) => FieldEval {
+                field: field.clone(),
+                value: None,
+                error: Some(err.to_string()),
+            },
+        })
+        .collect()
 }
 
 fn read_u16(bytes: &[u8], endianness: Endianness) -> u16 {
@@ -145,6 +171,36 @@ mod tests {
             FieldValue::Float(v) => assert_eq!(v, expected),
             other => panic!("expected Float, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn interpret_schema_collects_success_and_errors() {
+        let buffer = MemoryBuffer::from_vec(vec![0xDE, 0xAD, 0xBE]);
+
+        let schema = Schema {
+            schema_name: "mixed".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![
+                make_field("byte", FieldType::U8, 0, None),
+                make_field("u32_fail", FieldType::U32, 1, None),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+
+        assert_eq!(results.len(), 2);
+
+        let first = &results[0];
+        assert_eq!(first.field.name, "byte");
+        assert!(first.error.is_none());
+        assert_uint(first.value.clone().unwrap(), 0xDE);
+
+        let second = &results[1];
+        assert_eq!(second.field.name, "u32_fail");
+        assert!(second.value.is_none());
+        let err = second.error.clone().expect("expected an error");
+        assert!(err.contains("buffer error"));
     }
 
     #[test]
