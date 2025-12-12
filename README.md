@@ -1,55 +1,68 @@
-# BinOcular
+# BinOcular  
+*A schema-driven binary inspection toolkit for developers, reverse-engineers, and anyone who wants to stop guessing about byte layouts.*
 
-BinOcular is a portable, cross-platform binary inspection and analysis toolkit written in Rust.
-It provides a structured, schema-driven way to explore unknown binary formats, visualize data layouts, and build custom parsers—without guesswork.
+BinOcular is a portable, cross-platform binary analysis toolkit written in Rust.  
+It provides a structured, declarative way to explore unknown binary formats, visualize data layouts, and build custom parsers — without guesswork or hex-editor archaeology.
+
+This workspace includes both a CLI and an early GUI shell, with a long-term goal of becoming a fully extensible open-source binary inspection suite.
 
 ## Features
 
 - **Portable** — Windows-first, with Linux/macOS support planned  
-- **Fast & Safe** — Built on Rust’s zero-cost abstractions  
-- **Schema-Driven** — Define, load, and validate custom binary structures  
-- **Flexible Views** — Visualize offsets, endian patterns, and raw byte layouts  
-- **Extensible** — Support for plugins, custom readers, and custom parsers  
-- **Developer-Friendly** — Clean API for automation and tool integration
+- **Fast & Safe** — Rust’s safety guarantees without sacrificing performance  
+- **Schema-Driven** — Describe binary structures using a clean YAML layout format  
+- **Precise Visualization** — Offsets, endian behavior, integers, strings, blobs  
+- **Extensible** — Designed for plugins, custom field types, and external tooling  
+- **Developer-Friendly** — CLI output (table or JSON) for automation and testing  
 
-## Project Goals
+## Project Status
 
-BinOcular aims to become a reliable open-source utility for anyone who needs clear, practical insight into binary files—from reverse engineers to curious developers.
-
-## Status
-
-Early development.  
-Core design, schema format, and foundational Rust modules are being implemented.
+Active development.  
+The core schema engine, interpreter, and CLI are running; the GUI shell is in its early stages. A growing test suite verifies schema parsing, validation, and real-world use cases.
 
 ## Roadmap (High-Level)
 
-- [ ] Core binary reader engine  
-- [ ] Schema definition and validation system  
-- [ ] Hex/structure combined viewer  
-- [ ] Plugin interface  
-- [ ] Cross-platform builds  
-- [ ] CLI utilities for parsing and validation  
-- [ ] Optional GUI layer (future)
+- [x] Field interpreter & offset model  
+- [x] Schema parser + validation  
+- [x] CLI table + JSON output  
+- [x] Initial GUI (egui desktop shell)  
+- [ ] Full hex viewer + linked structure view  
+- [ ] Plugin/interface system  
+- [ ] Cross-platform build pipeline  
+- [ ] Advanced schema features (conditionals, arrays, computed fields)
 
 ## Workspace Layout
 
-- `crates/binocular-core` — buffer abstractions and the field interpreter.
-- `crates/binocular-schema` — YAML schema AST, parser, and validation helpers.
-- `crates/binocular-cli` — command-line companion that renders interpreted fields.
-- `crates/binocular-gui` — early-stage egui desktop shell.
+- `crates/binocular-core` — core buffer abstractions and field interpreter  
+- `crates/binocular-schema` — YAML AST, parser, schema validation logic  
+- `crates/binocular-cli` — command-line tool for rendering interpreted fields  
+- `crates/binocular-gui` — early-stage egui desktop application  
 
 ## Quickstart
 
-1. Install the Rust toolchain (Rust 1.76+ recommended).
-2. Build all crates: `cargo build`.
-3. Run tests to verify parsers and interpreters: `cargo test`.
+1. Install the Rust toolchain (Rust 1.76+ recommended)  
+2. Build all crates:
+
+   ```bash
+   cargo build
+   ```
+
+3. Run the full test suite:
+
+   ```bash
+   cargo test
+   ```
 
 ## Using the CLI
 
-The CLI consumes a binary file and a YAML schema that describes the layout. The schema format is defined in
-`binocular-schema` and validated before use.
+The CLI consumes a **binary file** and a **YAML schema**.  
+You must supply:
 
-Example schema (`packet.yml`):
+```
+binocular-cli --schema <SCHEMA> <FILE>
+```
+
+### Example schema (`packet.yml`)
 
 ```yaml
 schema_name: "Packet"
@@ -65,45 +78,45 @@ fields:
     length: 5
 ```
 
-Example binary creation and inspection:
+### Example binary & inspection
 
 ```bash
-# Create a tiny sample binary (0xABCD1234 followed by "hello")
+# Create sample binary
 python - <<'PY'
 with open('packet.bin', 'wb') as f:
     f.write((0xABCD1234).to_bytes(4, 'little'))
     f.write(b'hello')
 PY
 
-# Render the table view
-cargo run -p binocular-cli -- packet.bin --schema packet.yml
+# Render structured table view
+cargo run -p binocular-cli -- --schema packet.yml packet.bin
 
-# Emit machine-readable JSON instead
-cargo run -p binocular-cli -- packet.bin --schema packet.yml --json
+# Emit JSON instead:
+cargo run -p binocular-cli -- --schema packet.yml packet.bin --json
 ```
 
-Sample table output:
+### Example output
 
 ```
-NAME|OFFSET|TYPE|VALUE|ERROR
-magic|0 (0x00000000)|u32|2882343476 (0xABCD1234)|-
-payload|4 (0x00000004)|ascii[5]|"hello"|-
+NAME    | OFFSET            | TYPE       | VALUE                          | ERROR
+magic   | 0 (0x00000000)    | u32        | 2882343476 (0xABCD1234)        | -
+payload | 4 (0x00000004)    | ascii[5]   | "hello"                        | -
 ```
 
 ## GUI Preview
 
-The `binocular-gui` crate provides an egui-based desktop shell that can open files and display metadata. Launch it with:
+The GUI is a lightweight egui desktop shell that can open files, load schemas, and display early metadata.
 
 ```bash
 cargo run -p binocular-gui
 ```
 
-The current build shows file details and scaffolding for a hex view; more visualizers will arrive as the core stabilizes.
+More structured visualizers (hex view, linked fields, schema explorer) are planned.
 
 ## Contributing
 
-Contributions are welcome once the core layout stabilizes.
-Feel free to open issues, suggest schema improvements, or discuss design decisions.
+BinOcular is still solidifying its core architecture.  
+Issues, ideas, and design discussions are welcome — especially around schema clarity, new field types, UX, and testing approaches.
 
 ## License
 
