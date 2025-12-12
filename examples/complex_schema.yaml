@@ -28,5 +28,5 @@ fields:
     type: bytes
     offset:
       kind: Absolute
-      value: 18
+      value: 20
     length: 6
