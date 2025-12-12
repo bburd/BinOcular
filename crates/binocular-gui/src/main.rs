@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
 use binocular_core::buffer::{FileBuffer, MemoryBuffer};
-use binocular_core::interpret::{interpret_schema, FieldEval};
+use binocular_core::interpret::{interpret_schema, FieldEval, FieldValue};
 use binocular_schema::ast::Schema;
 use binocular_schema::parser::parse_schema_str;
 use eframe::egui;
@@ -150,6 +150,59 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
     }
 }
 
+fn format_offset(offset: &binocular_schema::ast::OffsetKind) -> String {
+    match offset {
+        binocular_schema::ast::OffsetKind::Absolute(value) => {
+            format!("0x{value:X} ({value})")
+        }
+        binocular_schema::ast::OffsetKind::Expr(expr) => expr.clone(),
+    }
+}
+
+fn format_value(value: &FieldValue) -> String {
+    match value {
+        FieldValue::UInt(v) => format!("{v} (0x{v:X})"),
+        FieldValue::Int(v) => format!("{v} (0x{v:X})"),
+        FieldValue::Float(v) => format!("{v}"),
+        FieldValue::Bytes(bytes) => bytes
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        FieldValue::Ascii(text) => text.clone(),
+    }
+}
+
+fn draw_field_table(ui: &mut egui::Ui, evaluations: &[FieldEval]) {
+    egui::Grid::new("field_evaluations")
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Name");
+            ui.strong("Offset");
+            ui.strong("Type");
+            ui.strong("Value");
+            ui.strong("Error");
+            ui.end_row();
+
+            for eval in evaluations {
+                ui.label(&eval.field.name);
+                ui.monospace(format_offset(&eval.field.offset));
+                ui.label(format!("{:?}", eval.field.ty));
+                if let Some(value) = &eval.value {
+                    ui.label(format_value(value));
+                } else {
+                    ui.label("-");
+                }
+                if let Some(error) = &eval.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                } else {
+                    ui.label("-");
+                }
+                ui.end_row();
+            }
+        });
+}
+
 impl eframe::App for BinOcularApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -176,6 +229,14 @@ impl eframe::App for BinOcularApp {
                     ui.label(format!("Size: {}", format_size(doc.size)));
                     ui.separator();
                     draw_hex_view(ui, doc);
+
+                    if let Some(evaluations) = doc.field_evaluations.as_ref() {
+                        if !evaluations.is_empty() {
+                            ui.separator();
+                            ui.heading("Interpreted Fields");
+                            draw_field_table(ui, evaluations);
+                        }
+                    }
                     return;
                 }
             }
