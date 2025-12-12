@@ -1,0 +1,32 @@
+schema_name: "complex_example"
+schema_version: 1
+endianness: little
+fields:
+  - name: magic16
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+  - name: code32
+    type: u32
+    offset:
+      kind: Absolute
+      value: 2
+    endianness: big
+  - name: delta
+    type: i32
+    offset:
+      kind: Absolute
+      value: 6
+  - name: label
+    type: ascii
+    offset:
+      kind: Absolute
+      value: 10
+    length: 10
+  - name: tail
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 18
+    length: 6
