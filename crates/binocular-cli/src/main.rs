@@ -27,6 +27,10 @@ struct Cli {
     /// Output as JSON instead of a human-readable table.
     #[arg(long)]
     json: bool,
+
+    /// Show branding banner and version then exit.
+    #[arg(long)]
+    branding: bool,
 }
 
 fn print_banner() {
@@ -40,6 +44,12 @@ fn print_badge() {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if cli.branding {
+        print_banner();
+        println!("v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     let file_bytes = fs::read(&cli.file)?;
     let schema_str = fs::read_to_string(&cli.schema)?;
