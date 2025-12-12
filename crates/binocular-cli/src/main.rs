@@ -9,30 +9,52 @@ use binocular_schema::parser::parse_schema_str;
 use clap::Parser;
 use serde_json::json;
 
+const BANNER: &str = include_str!("../assets/ascii/banner.txt");
+const BADGE: &str = include_str!("../assets/ascii/badge.txt");
+const TAGLINE: &str = "BinOcular — Know your bytes. Don’t guess them.";
+
 #[derive(Parser)]
 #[command(name = "binocular-cli")]
-#[command(about = "CLI companion for BinOcular", long_about = None)]
+#[command(
+    about = "BinOcular — Know your bytes. Don’t guess them.",
+    long_about = None,
+    disable_version_flag = true
+)]
 struct Cli {
     /// Path to the binary file to inspect.
+    #[arg(required_unless_present = "version")]
     file: PathBuf,
 
     /// Path to the YAML schema describing the file layout.
-    #[arg(short, long)]
+    #[arg(short, long, required_unless_present = "version")]
     schema: PathBuf,
 
     /// Output as JSON instead of a human-readable table.
     #[arg(long)]
     json: bool,
+
+    /// Show the banner, tagline, and version, then exit.
+    #[arg(short = 'V', long)]
+    version: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if cli.version {
+        print_banner();
+        println!("v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    print_badge();
 
     let file_bytes = fs::read(&cli.file)?;
     let schema_str = fs::read_to_string(&cli.schema)?;
     let schema = match parse_schema_str(&schema_str) {
         Ok(schema) => schema,
         Err(err) => {
+            print_badge();
             eprintln!("Failed to parse schema: {err}");
             process::exit(1);
         }
@@ -191,4 +213,13 @@ fn render_ascii(text: &str) -> String {
     }
 
     format!("\"{}\"", escaped)
+}
+
+fn print_banner() {
+    println!("{BANNER}");
+    println!("{TAGLINE}");
+}
+
+fn print_badge() {
+    eprintln!("{BADGE}");
 }

@@ -1,4 +1,10 @@
-# BinOcular  
+<p align="center">
+  <img src="crates/binocular-cli/assets/images/banner.png" width="600" alt="BinOcular ASCII binoculars" />
+</p>
+
+<h3 align="center"><em>BinOcular — Know your bytes. Don’t guess them.</em></h3>
+
+# BinOcular
 *A schema-driven binary inspection toolkit for developers, reverse-engineers, and anyone who wants to stop guessing about byte layouts.*
 
 BinOcular is a portable, cross-platform binary analysis toolkit written in Rust.  
