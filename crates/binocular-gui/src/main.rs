@@ -1,6 +1,8 @@
 use std::{fs, path::PathBuf};
 
 use binocular_core::buffer::{FileBuffer, MemoryBuffer};
+use binocular_core::interpret::FieldEval;
+use binocular_schema::ast::Schema;
 use eframe::egui;
 
 const MAX_HEX_BYTES: usize = 256;
@@ -10,6 +12,8 @@ struct Document {
     name: String,
     size: u64,
     buffer: MemoryBuffer,
+    schema: Option<Schema>,
+    field_evaluations: Option<Vec<FieldEval>>,
 }
 
 struct BinOcularApp {
@@ -58,6 +62,8 @@ impl BinOcularApp {
             name,
             size,
             buffer,
+            schema: None,
+            field_evaluations: None,
         })
     }
 }
@@ -103,7 +109,10 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
             }
         }
 
-        ui.monospace(format!("{:08X}: {} {}", row_start, hex_column, ascii_column));
+        ui.monospace(format!(
+            "{:08X}: {} {}",
+            row_start, hex_column, ascii_column
+        ));
     }
 }
 
