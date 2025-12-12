@@ -9,7 +9,7 @@ use eframe::egui;
 const MAX_HEX_BYTES: usize = 256;
 
 struct Document {
-    path: PathBuf,
+    _path: PathBuf,
     name: String,
     size: u64,
     buffer: MemoryBuffer,

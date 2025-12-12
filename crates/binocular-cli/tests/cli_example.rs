@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo::*;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Err
     let schema_path = workspace_root.join("examples/simple_schema.yaml");
     let bin_path = workspace_root.join("examples/simple.bin");
 
-    let output = Command::cargo_bin("binocular-cli")?
+    let output = cargo_bin_cmd!("binocular-cli")
         .args([
             "--json",
             "--schema",
@@ -47,7 +47,7 @@ fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Err
     assert!((value - 1.0).abs() < f64::EPSILON);
 
     assert_eq!(records[3].name, "status");
-    assert_eq!(records[3].value.as_str(), Some("\"OK!!\""));
+    assert_eq!(records[3].value.as_str(), Some("OK!!"));
 
     Ok(())
 }

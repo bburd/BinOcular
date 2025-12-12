@@ -75,7 +75,7 @@ fn main() -> anyhow::Result<()> {
             })
             .collect();
 
-        println!("{}", serde_json::Value::Array(json_records).to_string());
+        println!("{}", serde_json::Value::Array(json_records));
     } else {
         println!("NAME|OFFSET|TYPE|VALUE|ERROR");
         for record in records {
@@ -150,8 +150,8 @@ fn render_json_value(value: Option<FieldValue>) -> serde_json::Value {
         Some(FieldValue::UInt(v)) => json!(v),
         Some(FieldValue::Int(v)) => json!(v),
         Some(FieldValue::Float(v)) => json!(v),
-        Some(FieldValue::Bytes(bytes)) => json!(render_bytes(&bytes)),
-        Some(FieldValue::Ascii(text)) => json!(render_ascii(&text)),
+        Some(FieldValue::Bytes(bytes)) => json!(render_bytes(&bytes)), // fine to keep as hex string
+        Some(FieldValue::Ascii(text)) => json!(text),                  // 👈 use raw text
         None => serde_json::Value::Null,
     }
 }

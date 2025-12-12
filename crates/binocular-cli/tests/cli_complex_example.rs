@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo::*;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ fn complex_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Er
     let schema_path = workspace_root.join("examples/complex_schema.yaml");
     let bin_path = workspace_root.join("examples/complex.bin");
 
-    let output = Command::cargo_bin("binocular-cli")?
+    let output = cargo_bin_cmd!("binocular-cli")
         .args([
             "--json",
             "--schema",
