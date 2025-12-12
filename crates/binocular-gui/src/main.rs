@@ -1,8 +1,9 @@
 use std::{fs, path::PathBuf};
 
 use binocular_core::buffer::{FileBuffer, MemoryBuffer};
-use binocular_core::interpret::FieldEval;
+use binocular_core::interpret::{interpret_schema, FieldEval};
 use binocular_schema::ast::Schema;
+use binocular_schema::parser::parse_schema_str;
 use eframe::egui;
 
 const MAX_HEX_BYTES: usize = 256;
@@ -39,6 +40,39 @@ impl BinOcularApp {
                 Err(err) => {
                     eprintln!("Failed to open file: {err}");
                 }
+            }
+        }
+    }
+
+    fn load_schema_for_current_document(&mut self) {
+        let Some(doc_index) = self.current_doc else {
+            return;
+        };
+
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("YAML", &["yaml", "yml"])
+            .pick_file()
+        {
+            let schema_str = match fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(err) => {
+                    eprintln!("Failed to read schema file: {err}");
+                    return;
+                }
+            };
+
+            let schema = match parse_schema_str(&schema_str) {
+                Ok(schema) => schema,
+                Err(err) => {
+                    eprintln!("Failed to parse schema: {err}");
+                    return;
+                }
+            };
+
+            if let Some(doc) = self.documents.get_mut(doc_index) {
+                let evaluations = interpret_schema(&doc.buffer, &schema);
+                doc.schema = Some(schema);
+                doc.field_evaluations = Some(evaluations);
             }
         }
     }
@@ -124,6 +158,12 @@ impl eframe::App for BinOcularApp {
                     if ui.button("Open...").clicked() {
                         ui.close_menu();
                         self.open_document_dialog();
+                    }
+                });
+                ui.menu_button("Schema", |ui| {
+                    if ui.button("Load...").clicked() {
+                        ui.close_menu();
+                        self.load_schema_for_current_document();
                     }
                 });
             });
