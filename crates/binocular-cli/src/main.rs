@@ -9,6 +9,10 @@ use binocular_schema::parser::parse_schema_str;
 use clap::Parser;
 use serde_json::json;
 
+const BANNER: &str = include_str!("../assets/ascii/banner.txt");
+const BADGE: &str = include_str!("../assets/ascii/badge.txt");
+const TAGLINE: &str = "A schema-driven binary inspection toolkit for developers, reverse-engineers, and anyone who wants to stop guessing about byte layouts.";
+
 #[derive(Parser)]
 #[command(name = "binocular-cli")]
 #[command(about = "CLI companion for BinOcular", long_about = None)]
@@ -23,6 +27,15 @@ struct Cli {
     /// Output as JSON instead of a human-readable table.
     #[arg(long)]
     json: bool,
+}
+
+fn print_banner() {
+    print!("{BANNER}");
+    println!("{TAGLINE}");
+}
+
+fn print_badge() {
+    print!("{BADGE}");
 }
 
 fn main() -> anyhow::Result<()> {
