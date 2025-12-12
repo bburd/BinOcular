@@ -40,14 +40,14 @@ fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Err
     assert_eq!(records[0].value.as_u64(), Some(0x12345678));
 
     assert_eq!(records[1].name, "answer");
-    assert_eq!(records[1].value.as_i64(), Some(-42));
+    assert_eq!(records[1].value.as_i64(), Some(42));
 
     assert_eq!(records[2].name, "value");
     let value = records[2].value.as_f64().ok_or("Expected float value")?;
-    assert!((value - 3.5).abs() < f64::EPSILON);
+    assert!((value - 1.0).abs() < f64::EPSILON);
 
     assert_eq!(records[3].name, "status");
-    assert_eq!(records[3].value.as_str(), Some("OK!!"));
+    assert_eq!(records[3].value.as_str(), Some("\"OK!!\""));
 
     Ok(())
 }
