@@ -92,7 +92,7 @@ impl BinOcularApp {
             .unwrap_or_else(|| path.display().to_string());
 
         Ok(Document {
-            path,
+            _path: path,
             name,
             size,
             buffer,
