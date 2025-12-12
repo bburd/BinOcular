@@ -45,6 +45,8 @@ fn print_badge() {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    print_badge();
+
     if cli.branding {
         print_banner();
         println!("v{}", env!("CARGO_PKG_VERSION"));
