@@ -37,22 +37,20 @@ pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
         }
 
         match field.ty {
-            FieldType::Bytes | FieldType::Ascii => {
-                match field.length {
-                    Some(length) if length > 0 => {}
-                    Some(_) => {
-                        return Err(SchemaError::Validation(format!(
-                            "{field_label} has length 0; length must be greater than 0"
-                        )))
-                    }
-                    None => {
-                        return Err(SchemaError::Validation(format!(
-                            "{field_label} must specify length for type {:?}",
-                            field.ty
-                        )))
-                    }
+            FieldType::Bytes | FieldType::Ascii => match field.length {
+                Some(length) if length > 0 => {}
+                Some(_) => {
+                    return Err(SchemaError::Validation(format!(
+                        "{field_label} has length 0; length must be greater than 0"
+                    )))
                 }
-            }
+                None => {
+                    return Err(SchemaError::Validation(format!(
+                        "{field_label} must specify length for type {:?}",
+                        field.ty
+                    )))
+                }
+            },
             _ => {
                 if field.length.is_some() {
                     return Err(SchemaError::Validation(format!(
