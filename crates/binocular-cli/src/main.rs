@@ -62,10 +62,8 @@ fn main() -> anyhow::Result<()> {
 
     if !cli.json {
         print_badge();
-    }
 
-    if cli.branding {
-        if !cli.json {
+        if cli.branding {
             print_banner();
             println!("v{}", env!("CARGO_PKG_VERSION"));
             return Ok(());

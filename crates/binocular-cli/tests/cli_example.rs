@@ -53,7 +53,8 @@ fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
-fn json_mode_rejects_branding_to_preserve_stdout_contract() -> Result<(), Box<dyn std::error::Error>> {
+fn json_mode_rejects_branding_to_preserve_stdout_contract() -> Result<(), Box<dyn std::error::Error>>
+{
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|path| path.parent())
@@ -73,7 +74,10 @@ fn json_mode_rejects_branding_to_preserve_stdout_contract() -> Result<(), Box<dy
         ])
         .output()?;
 
-    assert!(!output.status.success(), "Branding must be rejected in JSON mode");
+    assert!(
+        !output.status.success(),
+        "Branding must be rejected in JSON mode"
+    );
     assert!(
         output.stdout.is_empty(),
         "JSON mode must keep stdout free of branding even on failure"
