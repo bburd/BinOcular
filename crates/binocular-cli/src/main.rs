@@ -26,11 +26,11 @@ const TAGLINE: &str = "A schema-driven binary inspection toolkit for developers,
 #[command(about = "CLI companion for BinOcular", long_about = None)]
 struct Cli {
     /// Path to the binary file to inspect.
-    #[arg(required_unless_present = "branding")]
+    #[arg(required_unless_present = "branding", required = false)]
     file: PathBuf,
 
     /// Path to the YAML schema describing the file layout.
-    #[arg(short, long, required_unless_present = "branding")]
+    #[arg(short, long, required_unless_present = "branding", required = false)]
     schema: PathBuf,
 
     /// Output as JSON instead of a human-readable table.
