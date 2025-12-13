@@ -36,7 +36,7 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// Show branding banner and version then exit.
+    /// Prepend branding banner and version before human-readable output.
     #[arg(long)]
     branding: bool,
 }
@@ -58,16 +58,6 @@ fn main() -> anyhow::Result<()> {
             "Branding output is disabled when --json is set; branding would break JSON stdout."
         );
         process::exit(2);
-    }
-
-    if !cli.json {
-        print_badge();
-
-        if cli.branding {
-            print_banner();
-            println!("v{}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
-        }
     }
 
     let file_bytes = fs::read(&cli.file)?;
@@ -120,7 +110,18 @@ fn main() -> anyhow::Result<()> {
             .collect();
 
         println!("{}", serde_json::Value::Array(json_records));
+
+        // Early return to avoid executing the branding branch below when
+        // `--json` is set. Branding is meant for human-readable output only.
+        return Ok(());
     } else {
+        print_badge();
+
+        if cli.branding {
+            print_banner();
+            println!("v{}", env!("CARGO_PKG_VERSION"));
+        }
+
         println!("NAME|OFFSET|TYPE|VALUE|ERROR");
         for record in records {
             let offset = render_offset(record.offset);
