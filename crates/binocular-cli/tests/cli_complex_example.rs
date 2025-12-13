@@ -33,6 +33,13 @@ fn complex_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Er
     assert!(output.status.success(), "CLI did not exit successfully");
 
     let stdout = String::from_utf8(output.stdout)?;
+    let trimmed = stdout.trim_start();
+
+    assert!(
+        matches!(trimmed.chars().next(), Some('[') | Some('{')),
+        "JSON output must start with an array or object delimiter"
+    );
+
     let records: Vec<Record> = serde_json::from_str(&stdout)?;
 
     assert_eq!(records.len(), 5);

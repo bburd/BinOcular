@@ -32,6 +32,13 @@ fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Err
     assert!(output.status.success(), "CLI did not exit successfully");
 
     let stdout = String::from_utf8(output.stdout)?;
+    let trimmed = stdout.trim_start();
+
+    assert!(
+        matches!(trimmed.chars().next(), Some('[') | Some('{')),
+        "JSON output must start with an array or object delimiter"
+    );
+
     let records: Vec<Record> = serde_json::from_str(&stdout)?;
 
     assert_eq!(records.len(), 4);
@@ -48,6 +55,44 @@ fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Err
 
     assert_eq!(records[3].name, "status");
     assert_eq!(records[3].value.as_str(), Some("OK!!"));
+
+    Ok(())
+}
+
+#[test]
+fn json_mode_emits_raw_json_without_branding() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or("Failed to determine workspace root")?
+        .to_path_buf();
+
+    let schema_path = workspace_root.join("examples/simple_schema.yaml");
+    let bin_path = workspace_root.join("examples/simple.bin");
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--schema",
+            schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let trimmed = stdout.trim_start();
+
+    assert!(
+        matches!(trimmed.chars().next(), Some('[') | Some('{')),
+        "JSON output must start with an array or object delimiter"
+    );
+
+    assert!(
+        !stdout.contains("schema-driven binary inspection toolkit"),
+        "JSON mode must omit branding copy"
+    );
 
     Ok(())
 }
