@@ -1,4 +1,10 @@
-# BinOcular  
+
+<p align="center">
+  <img src="crates/binocular-cli/assets/images/banner.png" alt="BinOcular banner" width="600" />
+</p>
+<p align="center"><i>A schema-driven binary inspection toolkit for developers, reverse-engineers, and anyone who wants to stop guessing about byte layouts.</i></p>
+
+# BinOcular
 *A schema-driven binary inspection toolkit for developers, reverse-engineers, and anyone who wants to stop guessing about byte layouts.*
 
 BinOcular is a portable, cross-platform binary analysis toolkit written in Rust.  
