@@ -54,6 +54,12 @@ fn print_badge() {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    if cli.branding {
+        print_banner();
+        println!("v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     if cli.json && cli.branding {
         eprintln!(
             "Branding output is disabled when --json is set; branding would break JSON stdout."
