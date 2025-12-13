@@ -1,3 +1,11 @@
+//! BinOcular CLI entrypoint.
+//!
+//! # Output contract
+//! The `--json` flag is meant for automation and must emit **only valid JSON to
+//! stdout**. No banners, badges, version strings, or other branding are allowed
+//! in this mode. CI and integration tests parse stdout as JSON directly, so any
+//! additional text will cause failures.
+
 use std::fs;
 use std::path::PathBuf;
 use std::process;
@@ -45,12 +53,23 @@ fn print_badge() {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    print_badge();
+    if cli.json && cli.branding {
+        eprintln!(
+            "Branding output is disabled when --json is set; branding would break JSON stdout."
+        );
+        process::exit(2);
+    }
+
+    if !cli.json {
+        print_badge();
+    }
 
     if cli.branding {
-        print_banner();
-        println!("v{}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        if !cli.json {
+            print_banner();
+            println!("v{}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
     }
 
     let file_bytes = fs::read(&cli.file)?;
@@ -85,6 +104,8 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // CI parses stdout as JSON directly in this branch; keep stdout free of
+    // banners, version strings, or other non-JSON content.
     if cli.json {
         let json_records: Vec<_> = records
             .into_iter()

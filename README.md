@@ -97,7 +97,7 @@ PY
 # Render structured table view
 cargo run -p binocular-cli -- --schema packet.yml packet.bin
 
-# Emit JSON instead:
+# Emit JSON instead (stdout must stay JSON-only for automation):
 cargo run -p binocular-cli -- --schema packet.yml packet.bin --json
 ```
 
@@ -108,6 +108,13 @@ NAME    | OFFSET            | TYPE       | VALUE                          | ERRO
 magic   | 0 (0x00000000)    | u32        | 2882343476 (0xABCD1234)        | -
 payload | 4 (0x00000004)    | ascii[5]   | "hello"                        | -
 ```
+
+### JSON output contract
+
+`--json` is designed for machine parsing and CI jobs. When this flag is set,
+the CLI must emit **only valid JSON to stdout** — no badges, banners, versions,
+or other branding are allowed. Passing `--branding` alongside `--json` will
+fail fast to protect this invariant.
 
 ## GUI Preview
 

@@ -51,3 +51,33 @@ fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Err
 
     Ok(())
 }
+
+#[test]
+fn json_mode_rejects_branding_to_preserve_stdout_contract() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or("Failed to determine workspace root")?
+        .to_path_buf();
+
+    let schema_path = workspace_root.join("examples/simple_schema.yaml");
+    let bin_path = workspace_root.join("examples/simple.bin");
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--branding",
+            "--schema",
+            schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    assert!(!output.status.success(), "Branding must be rejected in JSON mode");
+    assert!(
+        output.stdout.is_empty(),
+        "JSON mode must keep stdout free of branding even on failure"
+    );
+
+    Ok(())
+}
