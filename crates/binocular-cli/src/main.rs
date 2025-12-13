@@ -53,8 +53,11 @@ fn print_badge() {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-
-    if cli.branding {
+    if cli.branding
+        && !cli.json
+        && cli.file.as_os_str().is_empty()
+        && cli.schema.as_os_str().is_empty()
+    {
         print_banner();
         println!("v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
