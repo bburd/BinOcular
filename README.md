@@ -114,7 +114,8 @@ payload | 4 (0x00000004)    | ascii[5]   | "hello"                        | -
 `--json` is designed for machine parsing and CI jobs. When this flag is set,
 the CLI must emit **only valid JSON to stdout** — no badges, banners, versions,
 or other branding are allowed. Passing `--branding` alongside `--json` will
-fail fast to protect this invariant.
+fail fast to protect this invariant. When emitting the human-readable table,
+`--branding` prepends the badge, banner, and version before the records.
 
 ## GUI Preview
 
