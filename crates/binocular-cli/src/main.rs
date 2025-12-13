@@ -10,6 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process;
 
+use anyhow::Context;
 use binocular_core::buffer::MemoryBuffer;
 use binocular_core::interpret::{interpret_schema, FieldValue};
 use binocular_schema::ast::{FieldDef, FieldType, OffsetKind};
@@ -26,12 +27,12 @@ const TAGLINE: &str = "A schema-driven binary inspection toolkit for developers,
 #[command(about = "CLI companion for BinOcular", long_about = None)]
 struct Cli {
     /// Path to the binary file to inspect.
-    #[arg(required_unless_present = "branding", required = false)]
-    file: PathBuf,
+    #[arg(required_unless_present = "branding")]
+    file: Option<PathBuf>,
 
     /// Path to the YAML schema describing the file layout.
-    #[arg(short, long, required_unless_present = "branding", required = false)]
-    schema: PathBuf,
+    #[arg(short, long, required_unless_present = "branding")]
+    schema: Option<PathBuf>,
 
     /// Output as JSON instead of a human-readable table.
     #[arg(long)]
@@ -53,11 +54,7 @@ fn print_badge() {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if cli.branding
-        && !cli.json
-        && cli.file.as_os_str().is_empty()
-        && cli.schema.as_os_str().is_empty()
-    {
+    if cli.branding && !cli.json && cli.file.is_none() && cli.schema.is_none() {
         print_banner();
         println!("v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -70,8 +67,17 @@ fn main() -> anyhow::Result<()> {
         process::exit(2);
     }
 
-    let file_bytes = fs::read(&cli.file)?;
-    let schema_str = fs::read_to_string(&cli.schema)?;
+    let file = cli
+        .file
+        .as_ref()
+        .context("FILE is required unless --branding is set")?;
+    let schema = cli
+        .schema
+        .as_ref()
+        .context("--schema is required unless --branding is set")?;
+
+    let file_bytes = fs::read(file)?;
+    let schema_str = fs::read_to_string(schema)?;
     let schema = match parse_schema_str(&schema_str) {
         Ok(schema) => schema,
         Err(err) => {
