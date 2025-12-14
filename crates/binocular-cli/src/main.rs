@@ -52,7 +52,10 @@ fn print_banner() {
 }
 
 fn print_badge() {
-    print!("{BADGE}");
+    eprint!("{BADGE}");
+    if !BADGE.ends_with('\n') {
+        eprintln!();
+    }
 }
 
 fn main() -> anyhow::Result<()> {
