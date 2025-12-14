@@ -24,7 +24,7 @@ const TAGLINE: &str = "BinOcular — Know your bytes. Don’t guess them.";
 
 #[derive(Parser)]
 #[command(name = "binocular-cli")]
-#[command(about = "CLI companion for BinOcular", long_about = None)]
+#[command(about = "BinOcular — Know your bytes. Don’t guess them.", long_about = None)]
 struct Cli {
     /// Path to the binary file to inspect.
     #[arg(required_unless_present = "branding")]
