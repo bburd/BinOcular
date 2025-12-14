@@ -17,6 +17,8 @@ struct Document {
     field_evaluations: Option<Vec<FieldEval>>,
     last_error: Option<String>,
     schema_path: Option<PathBuf>,
+    hex_start_offset: u64,
+    hex_offset_input: String,
 }
 
 struct BinOcularApp {
@@ -108,6 +110,8 @@ impl BinOcularApp {
             field_evaluations: None,
             last_error: None,
             schema_path: None,
+            hex_start_offset: 0,
+            hex_offset_input: "0x0".to_string(),
         })
     }
 }
@@ -120,14 +124,15 @@ impl Document {
 
 fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
     const BYTES_PER_ROW: usize = 16;
-    let to_show = doc.size.min(MAX_HEX_BYTES as u64) as usize;
+    let remaining = doc.size.saturating_sub(doc.hex_start_offset);
+    let to_show = remaining.min(MAX_HEX_BYTES as u64) as usize;
 
     if to_show == 0 {
         ui.label("File is empty.");
         return;
     }
 
-    let Some(bytes) = doc.read_bytes(0, to_show) else {
+    let Some(bytes) = doc.read_bytes(doc.hex_start_offset, to_show) else {
         ui.label("Failed to read file data.");
         return;
     };
@@ -155,7 +160,9 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
 
         ui.monospace(format!(
             "{:08X}: {} {}",
-            row_start, hex_column, ascii_column
+            doc.hex_start_offset + row_start as u64,
+            hex_column,
+            ascii_column
         ));
     }
 }
@@ -250,6 +257,39 @@ impl eframe::App for BinOcularApp {
                         });
                         ui.add_space(4.0);
                     }
+
+                    ui.horizontal(|ui| {
+                        ui.label("Offset:");
+                        let _ = ui.text_edit_singleline(&mut doc.hex_offset_input);
+
+                        if ui.button("Go").clicked() {
+                            let input = doc.hex_offset_input.trim();
+                            let parsed_offset = if let Some(hex) = input
+                                .strip_prefix("0x")
+                                .or_else(|| input.strip_prefix("0X"))
+                            {
+                                u64::from_str_radix(hex, 16)
+                            } else {
+                                input.parse::<u64>()
+                            };
+
+                            match parsed_offset {
+                                Ok(offset) => {
+                                    let max_start = doc.size.saturating_sub(MAX_HEX_BYTES as u64);
+                                    let clamped = offset.min(max_start);
+                                    doc.hex_start_offset = clamped;
+                                    doc.hex_offset_input = format!("0x{:X}", clamped);
+                                    doc.last_error = None;
+                                }
+                                Err(_) => {
+                                    doc.last_error = Some(format!(
+                                        "Invalid offset: {}",
+                                        doc.hex_offset_input.trim()
+                                    ));
+                                }
+                            }
+                        }
+                    });
 
                     ui.separator();
                     draw_hex_view(ui, doc);
