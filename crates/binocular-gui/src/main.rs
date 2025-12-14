@@ -51,32 +51,38 @@ impl BinOcularApp {
             return;
         };
 
-        if let Some(path) = rfd::FileDialog::new()
+        let Some(path) = rfd::FileDialog::new()
             .add_filter("YAML", &["yaml", "yml"])
             .pick_file()
-        {
-            let schema_str = match fs::read_to_string(&path) {
-                Ok(contents) => contents,
-                Err(err) => {
-                    eprintln!("Failed to read schema file: {err}");
-                    return;
-                }
-            };
+        else {
+            return;
+        };
 
-            let schema = match parse_schema_str(&schema_str) {
-                Ok(schema) => schema,
-                Err(err) => {
-                    eprintln!("Failed to parse schema: {err}");
-                    return;
-                }
-            };
+        let Some(doc) = self.documents.get_mut(doc_index) else {
+            return;
+        };
 
-            if let Some(doc) = self.documents.get_mut(doc_index) {
-                let evaluations = interpret_schema(&doc.buffer, &schema);
-                doc.schema = Some(schema);
-                doc.field_evaluations = Some(evaluations);
+        let schema_str = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                doc.last_error = Some(format!("Failed to read schema file: {err}"));
+                return;
             }
-        }
+        };
+
+        let schema = match parse_schema_str(&schema_str) {
+            Ok(schema) => schema,
+            Err(err) => {
+                doc.last_error = Some(format!("Failed to parse or validate schema: {err}"));
+                return;
+            }
+        };
+
+        let evaluations = interpret_schema(&doc.buffer, &schema);
+        doc.schema = Some(schema);
+        doc.field_evaluations = Some(evaluations);
+        doc.schema_path = Some(path);
+        doc.last_error = None;
     }
 
     fn load_document_from_path(path: PathBuf) -> Result<Document, String> {
