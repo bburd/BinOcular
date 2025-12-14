@@ -234,9 +234,23 @@ impl eframe::App for BinOcularApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(index) = self.current_doc {
-                if let Some(doc) = self.documents.get(index) {
+                if let Some(doc) = self.documents.get_mut(index) {
                     ui.heading(&doc.name);
                     ui.label(format!("Size: {}", format_size(doc.size)));
+
+                    if let Some(error) = doc.last_error.clone() {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                egui::RichText::new(error).strong(),
+                            );
+                            if ui.button("Dismiss").clicked() {
+                                doc.last_error = None;
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+
                     ui.separator();
                     draw_hex_view(ui, doc);
 
@@ -244,6 +258,23 @@ impl eframe::App for BinOcularApp {
                         if !evaluations.is_empty() {
                             ui.separator();
                             ui.heading("Interpreted Fields");
+                            if let Some(schema) = doc.schema.as_ref() {
+                                let mut schema_label = format!(
+                                    "Schema: {} (v{})",
+                                    schema.schema_name, schema.schema_version
+                                );
+
+                                if let Some(schema_path) = doc.schema_path.as_ref() {
+                                    if let Some(file_name) = schema_path.file_name() {
+                                        schema_label.push_str(&format!(
+                                            " — {}",
+                                            file_name.to_string_lossy()
+                                        ));
+                                    }
+                                }
+
+                                ui.label(schema_label);
+                            }
                             draw_field_table(ui, evaluations);
                         }
                     }
