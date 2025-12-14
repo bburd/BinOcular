@@ -114,6 +114,42 @@ impl BinOcularApp {
             hex_offset_input: "0x0".to_string(),
         })
     }
+
+    fn reload_schema_for_current_document(&mut self) {
+        let Some(doc_index) = self.current_doc else {
+            return;
+        };
+
+        let Some(doc) = self.documents.get_mut(doc_index) else {
+            return;
+        };
+
+        let Some(schema_path) = doc.schema_path.clone() else {
+            doc.last_error = Some("No schema loaded to reload".to_string());
+            return;
+        };
+
+        let schema_str = match fs::read_to_string(&schema_path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                doc.last_error = Some(format!("Failed to read schema file: {err}"));
+                return;
+            }
+        };
+
+        let schema = match parse_schema_str(&schema_str) {
+            Ok(schema) => schema,
+            Err(err) => {
+                doc.last_error = Some(format!("Failed to parse or validate schema: {err}"));
+                return;
+            }
+        };
+
+        let evaluations = interpret_schema(&doc.buffer, &schema);
+        doc.schema = Some(schema);
+        doc.field_evaluations = Some(evaluations);
+        doc.last_error = None;
+    }
 }
 
 impl Document {
@@ -224,6 +260,11 @@ impl eframe::App for BinOcularApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
+                let schema_reload_enabled = self
+                    .current_doc
+                    .and_then(|index| self.documents.get(index))
+                    .is_some_and(|doc| doc.schema_path.is_some());
+
                 ui.menu_button("File", |ui| {
                     if ui.button("Open...").clicked() {
                         ui.close_menu();
@@ -234,6 +275,14 @@ impl eframe::App for BinOcularApp {
                     if ui.button("Load...").clicked() {
                         ui.close_menu();
                         self.load_schema_for_current_document();
+                    }
+
+                    if ui
+                        .add_enabled(schema_reload_enabled, egui::Button::new("Reload"))
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.reload_schema_for_current_document();
                     }
                 });
             });
