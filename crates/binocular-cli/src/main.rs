@@ -45,6 +45,9 @@ struct Cli {
 
 fn print_banner() {
     print!("{BANNER}");
+    if !BANNER.ends_with('\n') {
+        println!();
+    }
     println!("{TAGLINE}");
 }
 
