@@ -294,7 +294,7 @@ impl eframe::App for BinOcularApp {
                     ui.heading(&doc.name);
                     ui.label(format!("Size: {}", format_size(doc.size)));
 
-                    if let Some(error) = doc.last_error.clone() {
+                    if let Some(error) = doc.last_error.as_deref() {
                         ui.horizontal(|ui| {
                             ui.colored_label(
                                 ui.visuals().error_fg_color,
