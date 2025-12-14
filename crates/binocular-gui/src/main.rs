@@ -370,10 +370,8 @@ impl eframe::App for BinOcularApp {
 
                             if let Some(schema_path) = doc.schema_path.as_ref() {
                                 if let Some(file_name) = schema_path.file_name() {
-                                    schema_label.push_str(&format!(
-                                        " — {}",
-                                        file_name.to_string_lossy()
-                                    ));
+                                    schema_label
+                                        .push_str(&format!(" — {}", file_name.to_string_lossy()));
                                 }
                             }
 
