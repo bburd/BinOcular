@@ -15,6 +15,8 @@ struct Document {
     buffer: MemoryBuffer,
     schema: Option<Schema>,
     field_evaluations: Option<Vec<FieldEval>>,
+    last_error: Option<String>,
+    schema_path: Option<PathBuf>,
 }
 
 struct BinOcularApp {
@@ -98,6 +100,8 @@ impl BinOcularApp {
             buffer,
             schema: None,
             field_evaluations: None,
+            last_error: None,
+            schema_path: None,
         })
     }
 }
