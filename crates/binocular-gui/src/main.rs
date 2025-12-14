@@ -295,10 +295,11 @@ impl eframe::App for BinOcularApp {
                     ui.label(format!("Size: {}", format_size(doc.size)));
 
                     if let Some(error) = doc.last_error.as_deref() {
+                        let error_text = error.to_owned();
                         ui.horizontal(|ui| {
                             ui.colored_label(
                                 ui.visuals().error_fg_color,
-                                egui::RichText::new(error).strong(),
+                                egui::RichText::new(&error_text).strong(),
                             );
                             if ui.button("Dismiss").clicked() {
                                 doc.last_error = None;
