@@ -358,28 +358,32 @@ impl eframe::App for BinOcularApp {
                     ui.separator();
                     draw_hex_view(ui, doc);
 
-                    if let Some(evaluations) = doc.field_evaluations.as_ref() {
-                        if !evaluations.is_empty() {
-                            ui.separator();
-                            ui.heading("Interpreted Fields");
-                            if let Some(schema) = doc.schema.as_ref() {
-                                let mut schema_label = format!(
-                                    "Schema: {} (v{})",
-                                    schema.schema_name, schema.schema_version
-                                );
+                    if doc.schema.is_some() {
+                        ui.separator();
+                        ui.heading("Interpreted Fields");
 
-                                if let Some(schema_path) = doc.schema_path.as_ref() {
-                                    if let Some(file_name) = schema_path.file_name() {
-                                        schema_label.push_str(&format!(
-                                            " — {}",
-                                            file_name.to_string_lossy()
-                                        ));
-                                    }
+                        if let Some(schema) = doc.schema.as_ref() {
+                            let mut schema_label = format!(
+                                "Schema: {} (v{})",
+                                schema.schema_name, schema.schema_version
+                            );
+
+                            if let Some(schema_path) = doc.schema_path.as_ref() {
+                                if let Some(file_name) = schema_path.file_name() {
+                                    schema_label.push_str(&format!(
+                                        " — {}",
+                                        file_name.to_string_lossy()
+                                    ));
                                 }
-
-                                ui.label(schema_label);
                             }
-                            draw_field_table(ui, evaluations);
+
+                            ui.label(schema_label);
+                        }
+
+                        if let Some(evaluations) = doc.field_evaluations.as_ref() {
+                            if !evaluations.is_empty() {
+                                draw_field_table(ui, evaluations);
+                            }
                         }
                     }
                     return;
