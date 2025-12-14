@@ -1,4 +1,3 @@
-
 <p align="center">
   <img src="crates/binocular-cli/assets/images/banner.png" alt="BinOcular banner" width="600" />
 </p>
@@ -10,7 +9,7 @@
 BinOcular is a portable, cross-platform binary analysis toolkit written in Rust.  
 It provides a structured, declarative way to explore unknown binary formats, visualize data layouts, and build custom parsers — without guesswork or hex-editor archaeology.
 
-This workspace includes both a CLI and an early GUI shell, with a long-term goal of becoming a fully extensible open-source binary inspection suite.
+This workspace includes both a CLI and a GUI, with a long-term goal of becoming a fully extensible open-source binary inspection suite.
 
 ## Features
 
@@ -18,54 +17,53 @@ This workspace includes both a CLI and an early GUI shell, with a long-term goal
 - **Fast & Safe** — Rust’s safety guarantees without sacrificing performance  
 - **Schema-Driven** — Describe binary structures using a clean YAML layout format  
 - **Precise Visualization** — Offsets, endian behavior, integers, strings, blobs  
-- **Extensible** — Designed for plugins, custom field types, and external tooling  
+- **Extensible** — Designed for future plugins, custom field types, and tooling  
 - **Developer-Friendly** — CLI output (table or JSON) for automation and testing  
 
 ## Project Status
 
-Active development.  
-The core schema engine, interpreter, and CLI are running; the GUI shell is in its early stages. A growing test suite verifies schema parsing, validation, and real-world use cases.
+Active development (v0.1).  
+The core schema engine, interpreter, CLI, and GUI MVP are functional. A growing test suite verifies schema parsing, validation, and real-world use cases.
 
 ## Roadmap (High-Level)
 
 - [x] Field interpreter & offset model  
 - [x] Schema parser + validation  
 - [x] CLI table + JSON output  
-- [x] Initial GUI (egui desktop shell)  
-- [ ] Full hex viewer + linked structure view  
+- [x] GUI MVP (hex view + interpreted fields)  
+- [ ] Paging-backed hex viewer for large files  
+- [ ] Property tests and fuzzing  
 - [ ] Plugin/interface system  
-- [ ] Cross-platform build pipeline  
-- [ ] Advanced schema features (conditionals, arrays, computed fields)
+- [ ] Advanced schema features (arrays, expressions, nested structures)  
 
 ## Workspace Layout
 
 - `crates/binocular-core` — core buffer abstractions and field interpreter  
-- `crates/binocular-schema` — YAML AST, parser, schema validation logic  
-- `crates/binocular-cli` — command-line tool for rendering interpreted fields  
-- `crates/binocular-gui` — early-stage egui desktop application  
+- `crates/binocular-schema` — YAML AST, parser, and schema validation  
+- `crates/binocular-cli` — command-line tool for inspecting binaries  
+- `crates/binocular-gui` — egui desktop application  
 
 ## Quickstart
 
-1. Install the Rust toolchain (Rust 1.76+ recommended)  
+1. Install the Rust toolchain (Rust 1.76+ recommended)
 2. Build all crates:
 
-   ```bash
-   cargo build
-   ```
+```bash
+cargo build --workspace
+```
 
 3. Run the full test suite:
 
-   ```bash
-   cargo test
-   ```
+```bash
+cargo test --workspace
+```
 
 ## Using the CLI
 
-The CLI consumes a **binary file** and a **YAML schema**.  
-You must supply:
+The CLI consumes a **binary file** and a **YAML schema**.
 
-```
-binocular-cli --schema <SCHEMA> <FILE>
+```bash
+cargo run -p binocular-cli -- --schema <SCHEMA> <FILE>
 ```
 
 ### Example schema (`packet.yml`)
@@ -97,7 +95,7 @@ PY
 # Render structured table view
 cargo run -p binocular-cli -- --schema packet.yml packet.bin
 
-# Emit JSON instead (stdout must stay JSON-only for automation):
+# Emit JSON instead
 cargo run -p binocular-cli -- --schema packet.yml packet.bin --json
 ```
 
@@ -109,28 +107,25 @@ magic   | 0 (0x00000000)    | u32        | 2882343476 (0xABCD1234)        | -
 payload | 4 (0x00000004)    | ascii[5]   | "hello"                        | -
 ```
 
-### JSON output contract
+## GUI
 
-`--json` is designed for machine parsing and CI jobs. When this flag is set,
-the CLI must emit **only valid JSON to stdout** — no badges, banners, versions,
-or other branding are allowed. Passing `--branding` alongside `--json` will
-fail fast to protect this invariant. When emitting the human-readable table,
-`--branding` prepends the badge, banner, and version before the records.
+The GUI is a lightweight egui desktop application that can:
 
-## GUI Preview
-
-The GUI is a lightweight egui desktop shell that can open files, load schemas, and display early metadata.
+- Open binary files
+- Load YAML schemas
+- Display a hex preview
+- Show interpreted fields
 
 ```bash
 cargo run -p binocular-gui
 ```
 
-More structured visualizers (hex view, linked fields, schema explorer) are planned.
+More advanced visualizations and large-file support are planned.
 
 ## Contributing
 
-BinOcular is still solidifying its core architecture.  
-Issues, ideas, and design discussions are welcome — especially around schema clarity, new field types, UX, and testing approaches.
+BinOcular is still evolving.  
+Issues, ideas, and design discussions are welcome — especially around schema clarity, new field types, UX, and testing.
 
 ## License
 
