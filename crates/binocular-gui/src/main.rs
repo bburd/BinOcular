@@ -16,6 +16,7 @@ struct Document {
     schema: Option<Schema>,
     field_evaluations: Option<Vec<FieldEval>>,
     last_error: Option<String>,
+    last_error_is_offset: bool,
     schema_path: Option<PathBuf>,
     hex_start_offset: u64,
     hex_offset_input: String,
@@ -68,6 +69,7 @@ impl BinOcularApp {
             Ok(contents) => contents,
             Err(err) => {
                 doc.last_error = Some(format!("Failed to read schema file: {err}"));
+                doc.last_error_is_offset = false;
                 return;
             }
         };
@@ -76,6 +78,7 @@ impl BinOcularApp {
             Ok(schema) => schema,
             Err(err) => {
                 doc.last_error = Some(format!("Failed to parse or validate schema: {err}"));
+                doc.last_error_is_offset = false;
                 return;
             }
         };
@@ -85,6 +88,7 @@ impl BinOcularApp {
         doc.field_evaluations = Some(evaluations);
         doc.schema_path = Some(path);
         doc.last_error = None;
+        doc.last_error_is_offset = false;
     }
 
     fn load_document_from_path(path: PathBuf) -> Result<Document, String> {
@@ -109,6 +113,7 @@ impl BinOcularApp {
             schema: None,
             field_evaluations: None,
             last_error: None,
+            last_error_is_offset: false,
             schema_path: None,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
@@ -126,6 +131,7 @@ impl BinOcularApp {
 
         let Some(schema_path) = doc.schema_path.clone() else {
             doc.last_error = Some("No schema loaded to reload".to_string());
+            doc.last_error_is_offset = false;
             return;
         };
 
@@ -133,6 +139,7 @@ impl BinOcularApp {
             Ok(contents) => contents,
             Err(err) => {
                 doc.last_error = Some(format!("Failed to read schema file: {err}"));
+                doc.last_error_is_offset = false;
                 return;
             }
         };
@@ -141,6 +148,7 @@ impl BinOcularApp {
             Ok(schema) => schema,
             Err(err) => {
                 doc.last_error = Some(format!("Failed to parse or validate schema: {err}"));
+                doc.last_error_is_offset = false;
                 return;
             }
         };
@@ -149,6 +157,7 @@ impl BinOcularApp {
         doc.schema = Some(schema);
         doc.field_evaluations = Some(evaluations);
         doc.last_error = None;
+        doc.last_error_is_offset = false;
     }
 }
 
@@ -303,6 +312,7 @@ impl eframe::App for BinOcularApp {
                             );
                             if ui.button("Dismiss").clicked() {
                                 doc.last_error = None;
+                                doc.last_error_is_offset = false;
                             }
                         });
                         ui.add_space(4.0);
@@ -329,13 +339,17 @@ impl eframe::App for BinOcularApp {
                                     let clamped = offset.min(max_start);
                                     doc.hex_start_offset = clamped;
                                     doc.hex_offset_input = format!("0x{:X}", clamped);
-                                    doc.last_error = None;
+                                    if doc.last_error_is_offset {
+                                        doc.last_error = None;
+                                        doc.last_error_is_offset = false;
+                                    }
                                 }
                                 Err(_) => {
                                     doc.last_error = Some(format!(
                                         "Invalid offset: {}",
                                         doc.hex_offset_input.trim()
                                     ));
+                                    doc.last_error_is_offset = true;
                                 }
                             }
                         }
