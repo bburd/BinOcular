@@ -20,7 +20,7 @@ use serde_json::json;
 
 const BANNER: &str = include_str!("../assets/ascii/banner.txt");
 const BADGE: &str = include_str!("../assets/ascii/badge.txt");
-const TAGLINE: &str = "A schema-driven binary inspection toolkit for developers, reverse-engineers, and anyone who wants to stop guessing about byte layouts.";
+const TAGLINE: &str = "BinOcular — Know your bytes. Don’t guess them.";
 
 #[derive(Parser)]
 #[command(name = "binocular-cli")]

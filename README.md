@@ -2,7 +2,7 @@
 <p align="center">
   <img src="crates/binocular-cli/assets/images/banner.png" alt="BinOcular banner" width="600" />
 </p>
-<p align="center"><i>A schema-driven binary inspection toolkit for developers, reverse-engineers, and anyone who wants to stop guessing about byte layouts.</i></p>
+<p align="center"><i>BinOcular — Know your bytes. Don’t guess them.</i></p>
 
 # BinOcular
 *A schema-driven binary inspection toolkit for developers, reverse-engineers, and anyone who wants to stop guessing about byte layouts.*

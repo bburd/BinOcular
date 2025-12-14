@@ -90,7 +90,7 @@ fn json_mode_emits_raw_json_without_branding() -> Result<(), Box<dyn std::error:
     );
 
     assert!(
-        !stdout.contains("schema-driven binary inspection toolkit"),
+        !stdout.contains("BinOcular — Know your bytes. Don’t guess them."),
         "JSON mode must omit branding copy"
     );
 
@@ -156,7 +156,7 @@ fn branding_adds_header_to_human_output() -> Result<(), Box<dyn std::error::Erro
     let stdout = String::from_utf8(output.stdout)?;
 
     assert!(
-        stdout.contains("A schema-driven binary inspection toolkit"),
+        stdout.contains("BinOcular — Know your bytes. Don’t guess them."),
         "Branding must include the banner and tagline"
     );
     assert!(
