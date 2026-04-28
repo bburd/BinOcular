@@ -76,6 +76,8 @@ pub fn parse_schema_str(yaml: &str) -> Result<Schema, SchemaError> {
 mod tests {
     use super::*;
     use crate::ast::{Endianness, FieldDef, OffsetKind, RepeatInfo};
+    use proptest::prelude::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn base_schema() -> Schema {
         Schema {
@@ -274,5 +276,94 @@ fields:
 "#;
 
         expect_validation_error(yaml);
+    }
+
+    fn arb_endianness() -> impl Strategy<Value = Endianness> {
+        prop_oneof![Just(Endianness::Little), Just(Endianness::Big),]
+    }
+
+    fn arb_field_type() -> impl Strategy<Value = FieldType> {
+        prop_oneof![
+            Just(FieldType::U8),
+            Just(FieldType::U16),
+            Just(FieldType::U32),
+            Just(FieldType::U64),
+            Just(FieldType::I32),
+            Just(FieldType::F32),
+            Just(FieldType::Bytes),
+            Just(FieldType::Ascii),
+        ]
+    }
+
+    fn arb_offset_kind() -> impl Strategy<Value = OffsetKind> {
+        prop_oneof![
+            any::<u64>().prop_map(OffsetKind::Absolute),
+            any::<String>().prop_map(OffsetKind::Expr),
+        ]
+    }
+
+    fn arb_repeat_info() -> impl Strategy<Value = RepeatInfo> {
+        any::<u64>().prop_map(|count| RepeatInfo { count })
+    }
+
+    fn arb_field_def() -> impl Strategy<Value = FieldDef> {
+        (
+            any::<String>(),
+            arb_field_type(),
+            arb_offset_kind(),
+            proptest::option::of(any::<u64>()),
+            proptest::option::of(arb_endianness()),
+            proptest::option::of(any::<String>()),
+            proptest::option::of(arb_repeat_info()),
+        )
+            .prop_map(
+                |(name, ty, offset, length, endianness, description, repeat)| FieldDef {
+                    name,
+                    ty,
+                    offset,
+                    length,
+                    endianness,
+                    description,
+                    repeat,
+                },
+            )
+    }
+
+    fn arb_schema() -> impl Strategy<Value = Schema> {
+        (
+            any::<String>(),
+            any::<u32>(),
+            proptest::option::of(arb_endianness()),
+            prop::collection::vec(arb_field_def(), 0..16),
+        )
+            .prop_map(|(schema_name, schema_version, endianness, fields)| Schema {
+                schema_name,
+                schema_version,
+                endianness,
+                fields,
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn parse_schema_str_is_panic_safe_for_arbitrary_yaml(input in any::<String>()) {
+            let caught = catch_unwind(AssertUnwindSafe(|| parse_schema_str(&input)));
+            prop_assert!(caught.is_ok(), "parse_schema_str panicked for input: {:?}", input);
+
+            match caught.expect("already checked is_ok") {
+                Ok(_) | Err(SchemaError::Yaml(_)) | Err(SchemaError::Validation(_)) => {}
+            }
+        }
+
+        #[test]
+        fn validate_schema_is_panic_safe_for_arbitrary_schema(schema in arb_schema()) {
+            let caught = catch_unwind(AssertUnwindSafe(|| validate_schema(&schema)));
+            prop_assert!(caught.is_ok(), "validate_schema panicked for schema: {:?}", schema);
+
+            match caught.expect("already checked is_ok") {
+                Ok(()) | Err(SchemaError::Validation(_)) => {}
+                Err(other) => prop_assert!(false, "unexpected error variant: {:?}", other),
+            }
+        }
     }
 }
