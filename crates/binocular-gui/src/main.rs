@@ -6,7 +6,7 @@ use binocular_schema::ast::Schema;
 use binocular_schema::parser::parse_schema_str;
 use eframe::egui;
 
-const MAX_HEX_BYTES: usize = 256;
+const HEX_PAGE_SIZE: usize = 1024;
 const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 struct Document {
@@ -176,7 +176,7 @@ impl Document {
 fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
     const BYTES_PER_ROW: usize = 16;
     let remaining = doc.size.saturating_sub(doc.hex_start_offset);
-    let to_show = remaining.min(MAX_HEX_BYTES as u64) as usize;
+    let to_show = remaining.min(HEX_PAGE_SIZE as u64) as usize;
 
     if to_show == 0 {
         ui.label("File is empty.");
@@ -325,7 +325,7 @@ impl eframe::App for BinOcularApp {
                     }
 
                     ui.horizontal(|ui| {
-                        ui.label("Offset:");
+                        ui.label("Go to offset:");
                         let _ = ui.text_edit_singleline(&mut doc.hex_offset_input);
 
                         if ui.button("Go").clicked() {
@@ -341,7 +341,7 @@ impl eframe::App for BinOcularApp {
 
                             match parsed_offset {
                                 Ok(offset) => {
-                                    let max_start = doc.size.saturating_sub(MAX_HEX_BYTES as u64);
+                                    let max_start = doc.size.saturating_sub(HEX_PAGE_SIZE as u64);
                                     let clamped = offset.min(max_start);
                                     doc.hex_start_offset = clamped;
                                     doc.hex_offset_input = format!("0x{:X}", clamped);
@@ -357,6 +357,43 @@ impl eframe::App for BinOcularApp {
                                     ));
                                     doc.last_error_is_offset = true;
                                 }
+                            }
+                        }
+
+                        let max_start = doc.size.saturating_sub(HEX_PAGE_SIZE as u64);
+                        if ui
+                            .add_enabled(
+                                doc.hex_start_offset > 0,
+                                egui::Button::new("Previous page"),
+                            )
+                            .clicked()
+                        {
+                            let new_offset =
+                                doc.hex_start_offset.saturating_sub(HEX_PAGE_SIZE as u64);
+                            doc.hex_start_offset = new_offset;
+                            doc.hex_offset_input = format!("0x{:X}", new_offset);
+                            if doc.last_error_is_offset {
+                                doc.last_error = None;
+                                doc.last_error_is_offset = false;
+                            }
+                        }
+
+                        if ui
+                            .add_enabled(
+                                doc.hex_start_offset < max_start,
+                                egui::Button::new("Next page"),
+                            )
+                            .clicked()
+                        {
+                            let new_offset = doc
+                                .hex_start_offset
+                                .saturating_add(HEX_PAGE_SIZE as u64)
+                                .min(max_start);
+                            doc.hex_start_offset = new_offset;
+                            doc.hex_offset_input = format!("0x{:X}", new_offset);
+                            if doc.last_error_is_offset {
+                                doc.last_error = None;
+                                doc.last_error_is_offset = false;
                             }
                         }
                     });
