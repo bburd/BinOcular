@@ -18,8 +18,8 @@ This workspace includes both a CLI and a GUI, with a long-term goal of becoming 
 - **Schema-Driven** — Describe binary structures using a clean YAML layout format  
 - **Precise Visualization** — Offsets, endian behavior, integers, strings, blobs  
 - **GUI Buffer Abstraction** — GUI reads through the same buffer layer used across the workspace  
-- **Large File Support (v0.3)** — Memory-mapped backend for efficient access to large binaries  
-- **Paged Hex View** — Navigate large files via windowed paging (Prev/Next/Go to offset)  
+- **Large-File mmap Backend** — Memory-mapped backend for efficient access to large binaries  
+- **Windowed/Paged Hex View** — Hex display reads a page/window at a time instead of loading whole files  
 - **Developer-Friendly** — CLI output (table or JSON) for automation and testing  
 
 ## Project Status
@@ -81,7 +81,7 @@ Current GUI architecture uses a buffer abstraction with a memory-mapped backend 
 - [x] CLI table + JSON output  
 - [x] GUI MVP (hex view + interpreted fields)  
 - [x] Paging-backed hex viewer for large files  
-- [x] Property tests and crash-harness hardening
+- [x] Property tests and fuzzing hardening
 - [ ] Plugin/interface system  
 - [ ] Advanced schema features (arrays, expressions, nested structures)  
 
