@@ -11,6 +11,9 @@ pub enum InterpretError {
     #[error("buffer error: {0}")]
     Buffer(#[from] BufferError),
 
+    #[error("invalid numeric byte width: expected {expected}, got {actual}")]
+    InvalidNumericByteWidth { expected: usize, actual: usize },
+
     #[error("unsupported field type in this core version")]
     Unsupported,
 }
