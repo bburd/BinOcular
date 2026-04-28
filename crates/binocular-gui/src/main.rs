@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use binocular_core::buffer::{FileBuffer, MemoryBuffer};
 use binocular_core::interpret::{interpret_schema, FieldEval, FieldValue};
@@ -12,7 +12,7 @@ struct Document {
     _path: PathBuf,
     name: String,
     size: u64,
-    buffer: MemoryBuffer,
+    buffer: Arc<dyn FileBuffer>,
     schema: Option<Schema>,
     field_evaluations: Option<Vec<FieldEval>>,
     last_error: Option<String>,
@@ -83,7 +83,7 @@ impl BinOcularApp {
             }
         };
 
-        let evaluations = interpret_schema(&doc.buffer, &schema);
+        let evaluations = interpret_schema(doc.buffer.as_ref(), &schema);
         doc.schema = Some(schema);
         doc.field_evaluations = Some(evaluations);
         doc.schema_path = Some(path);
@@ -99,7 +99,7 @@ impl BinOcularApp {
 
         let size = metadata.len();
         let data = fs::read(&path).map_err(|err| err.to_string())?;
-        let buffer = MemoryBuffer::from_vec(data);
+        let buffer: Arc<dyn FileBuffer> = Arc::new(MemoryBuffer::from_vec(data));
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
@@ -153,7 +153,7 @@ impl BinOcularApp {
             }
         };
 
-        let evaluations = interpret_schema(&doc.buffer, &schema);
+        let evaluations = interpret_schema(doc.buffer.as_ref(), &schema);
         doc.schema = Some(schema);
         doc.field_evaluations = Some(evaluations);
         doc.last_error = None;

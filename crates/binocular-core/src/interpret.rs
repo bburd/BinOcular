@@ -18,7 +18,7 @@ pub struct FieldEval {
     pub error: Option<String>,
 }
 
-pub fn interpret_field<B: FileBuffer>(
+pub fn interpret_field<B: FileBuffer + ?Sized>(
     buffer: &B,
     field: &FieldDef,
     schema: Option<&Schema>,
@@ -75,7 +75,7 @@ pub fn interpret_field<B: FileBuffer>(
     Ok(value)
 }
 
-pub fn interpret_schema<B: FileBuffer>(buffer: &B, schema: &Schema) -> Vec<FieldEval> {
+pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> Vec<FieldEval> {
     schema
         .fields
         .iter()
