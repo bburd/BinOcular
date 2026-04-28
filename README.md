@@ -22,8 +22,30 @@ This workspace includes both a CLI and a GUI, with a long-term goal of becoming 
 
 ## Project Status
 
-Active development (v0.1).  
-The core schema engine, interpreter, CLI, and GUI MVP are functional. A growing test suite verifies schema parsing, validation, and real-world use cases.
+Active development (**v0.2.0**).  
+The core schema engine, interpreter, CLI, and GUI MVP are functional.  
+This release focused on hardening and crash resistance under malformed input.
+
+## v0.2.0 Hardening Summary
+
+**TL;DR:** v0.2.0 made BinOcular crash-resistant.
+
+### What changed
+
+- Removed panic paths in the interpreter (including `unwrap` in numeric decoding)
+- Added property tests for schema parsing and validation
+- Added a randomized crash harness for the end-to-end pipeline
+
+### What it means
+
+- Arbitrary or malformed input now yields structured errors instead of crashes
+- Much higher confidence in stability across parser + interpreter + CLI flow
+
+### What didn't change
+
+- No new features
+- No schema expansion
+- No UI changes
 
 ## Roadmap (High-Level)
 
@@ -32,7 +54,7 @@ The core schema engine, interpreter, CLI, and GUI MVP are functional. A growing 
 - [x] CLI table + JSON output  
 - [x] GUI MVP (hex view + interpreted fields)  
 - [ ] Paging-backed hex viewer for large files  
-- [ ] Property tests and fuzzing  
+- [x] Property tests and fuzzing hardening
 - [ ] Plugin/interface system  
 - [ ] Advanced schema features (arrays, expressions, nested structures)  
 
