@@ -21,6 +21,8 @@ struct Document {
     schema_path: Option<PathBuf>,
     hex_start_offset: u64,
     hex_offset_input: String,
+    selected_field_range: Option<(u64, usize)>,
+    selected_field_name: Option<String>,
 }
 
 struct BinOcularApp {
@@ -90,6 +92,7 @@ impl BinOcularApp {
         doc.schema_path = Some(path);
         doc.last_error = None;
         doc.last_error_is_offset = false;
+        doc.clear_selected_field();
     }
 
     fn load_document_from_path(path: PathBuf) -> Result<Document, String> {
@@ -123,6 +126,8 @@ impl BinOcularApp {
             schema_path: None,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
+            selected_field_range: None,
+            selected_field_name: None,
         })
     }
 
@@ -164,12 +169,35 @@ impl BinOcularApp {
         doc.field_evaluations = Some(evaluations);
         doc.last_error = None;
         doc.last_error_is_offset = false;
+        doc.clear_selected_field();
     }
 }
 
 impl Document {
     fn read_bytes(&self, offset: u64, len: usize) -> Option<&[u8]> {
         self.buffer.read_bytes(offset, len).ok()
+    }
+
+    fn clear_selected_field(&mut self) {
+        self.selected_field_range = None;
+        self.selected_field_name = None;
+    }
+
+    fn select_field(&mut self, name: String, offset: u64, byte_len: usize) {
+        self.selected_field_name = Some(name);
+        self.selected_field_range = Some((offset, byte_len));
+
+        if byte_len == 0 {
+            return;
+        }
+
+        let page_end = self.hex_start_offset.saturating_add(HEX_PAGE_SIZE as u64);
+        if offset < self.hex_start_offset || offset >= page_end {
+            let max_start = self.size.saturating_sub(HEX_PAGE_SIZE as u64);
+            let new_offset = offset.min(max_start);
+            self.hex_start_offset = new_offset;
+            self.hex_offset_input = format!("0x{:X}", new_offset);
+        }
     }
 }
 
@@ -188,33 +216,56 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
         return;
     };
 
+    let visible_end = doc.hex_start_offset.saturating_add(to_show as u64);
+    let selected_visible_range = doc.selected_field_range.and_then(|(start, byte_len)| {
+        if byte_len == 0 {
+            return None;
+        }
+
+        let end = start.saturating_add(byte_len as u64);
+        let visible_start = start.max(doc.hex_start_offset);
+        let visible_end = end.min(visible_end);
+        (visible_start < visible_end).then_some((visible_start, visible_end))
+    });
+
     for row_start in (0..bytes.len()).step_by(BYTES_PER_ROW) {
         let row_end = (row_start + BYTES_PER_ROW).min(bytes.len());
         let row = &bytes[row_start..row_end];
-
-        let mut hex_column = String::new();
         let mut ascii_column = String::new();
 
         for i in 0..BYTES_PER_ROW {
             if let Some(byte) = row.get(i) {
-                hex_column.push_str(&format!("{:02X} ", byte));
                 let ch = if (0x20..=0x7E).contains(byte) {
                     *byte as char
                 } else {
                     '.'
                 };
                 ascii_column.push(ch);
-            } else {
-                hex_column.push_str("   ");
             }
         }
 
-        ui.monospace(format!(
-            "{:08X}: {} {}",
-            doc.hex_start_offset + row_start as u64,
-            hex_column,
-            ascii_column
-        ));
+        ui.horizontal(|ui| {
+            ui.monospace(format!("{:08X}:", doc.hex_start_offset + row_start as u64));
+
+            for i in 0..BYTES_PER_ROW {
+                if let Some(byte) = row.get(i) {
+                    let absolute_offset = doc.hex_start_offset + row_start as u64 + i as u64;
+                    let is_selected = selected_visible_range.is_some_and(|(start, end)| {
+                        absolute_offset >= start && absolute_offset < end
+                    });
+
+                    let mut byte_text = egui::RichText::new(format!("{byte:02X}")).monospace();
+                    if is_selected {
+                        byte_text = byte_text.background_color(ui.visuals().selection.bg_fill);
+                    }
+                    ui.label(byte_text);
+                } else {
+                    ui.monospace("  ");
+                }
+            }
+
+            ui.monospace(ascii_column);
+        });
     }
 }
 
@@ -236,7 +287,13 @@ fn format_value(value: &FieldValue) -> String {
     }
 }
 
-fn draw_field_table(ui: &mut egui::Ui, evaluations: &[FieldEval]) {
+fn draw_field_table(
+    ui: &mut egui::Ui,
+    evaluations: &[FieldEval],
+    selected_range: Option<(u64, usize)>,
+) -> Option<(String, u64, usize)> {
+    let mut clicked_field = None;
+
     egui::Grid::new("field_evaluations")
         .striped(true)
         .show(ui, |ui| {
@@ -248,7 +305,16 @@ fn draw_field_table(ui: &mut egui::Ui, evaluations: &[FieldEval]) {
             ui.end_row();
 
             for eval in evaluations {
-                ui.label(&eval.display_name);
+                let is_selected = selected_range
+                    .is_some_and(|selected| selected == (eval.resolved_offset, eval.byte_len));
+                let response = ui.selectable_label(is_selected, &eval.display_name);
+                if response.clicked() {
+                    clicked_field = Some((
+                        eval.display_name.clone(),
+                        eval.resolved_offset,
+                        eval.byte_len,
+                    ));
+                }
                 ui.monospace(format_resolved_offset(eval.resolved_offset));
                 ui.label(format!("{:?}", eval.field.ty));
                 if let Some(value) = &eval.value {
@@ -264,6 +330,8 @@ fn draw_field_table(ui: &mut egui::Ui, evaluations: &[FieldEval]) {
                 ui.end_row();
             }
         });
+
+    clicked_field
 }
 
 impl eframe::App for BinOcularApp {
@@ -394,6 +462,11 @@ impl eframe::App for BinOcularApp {
                     });
 
                     ui.separator();
+                    if let (Some(name), Some((offset, len))) =
+                        (doc.selected_field_name.as_deref(), doc.selected_field_range)
+                    {
+                        ui.label(format!("Selected: {name} @ 0x{offset:08X} (len {len})"));
+                    }
                     draw_hex_view(ui, doc);
 
                     if doc.schema.is_some() {
@@ -418,7 +491,11 @@ impl eframe::App for BinOcularApp {
 
                         if let Some(evaluations) = doc.field_evaluations.as_ref() {
                             if !evaluations.is_empty() {
-                                draw_field_table(ui, evaluations);
+                                if let Some((name, offset, byte_len)) =
+                                    draw_field_table(ui, evaluations, doc.selected_field_range)
+                                {
+                                    doc.select_field(name, offset, byte_len);
+                                }
                             }
                         }
                     }
