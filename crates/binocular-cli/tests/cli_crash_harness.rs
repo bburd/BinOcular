@@ -41,9 +41,6 @@ fn schema_and_interpretation_pipeline_is_panic_safe_for_random_inputs() {
             }
         }));
 
-        assert!(
-            caught.is_ok(),
-            "pipeline panicked on iteration {iteration}"
-        );
+        assert!(caught.is_ok(), "pipeline panicked on iteration {iteration}");
     }
 }

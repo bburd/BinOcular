@@ -218,13 +218,8 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
     }
 }
 
-fn format_offset(offset: &binocular_schema::ast::OffsetKind) -> String {
-    match offset {
-        binocular_schema::ast::OffsetKind::Absolute(value) => {
-            format!("0x{value:X} ({value})")
-        }
-        binocular_schema::ast::OffsetKind::Expr(expr) => expr.clone(),
-    }
+fn format_resolved_offset(offset: u64) -> String {
+    format!("0x{offset:X} ({offset})")
 }
 
 fn format_value(value: &FieldValue) -> String {
@@ -253,8 +248,8 @@ fn draw_field_table(ui: &mut egui::Ui, evaluations: &[FieldEval]) {
             ui.end_row();
 
             for eval in evaluations {
-                ui.label(&eval.field.name);
-                ui.monospace(format_offset(&eval.field.offset));
+                ui.label(&eval.display_name);
+                ui.monospace(format_resolved_offset(eval.resolved_offset));
                 ui.label(format!("{:?}", eval.field.ty));
                 if let Some(value) = &eval.value {
                     ui.label(format_value(value));

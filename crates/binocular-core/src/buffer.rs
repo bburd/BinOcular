@@ -115,8 +115,14 @@ mod tests {
 
         let mmap = MmapBuffer::open(file.path()).expect("mmap open should succeed");
 
-        assert_eq!(mmap.read_bytes(1, 3).expect("valid range should read"), &bytes[1..4]);
-        assert_eq!(mmap.read_bytes(0, 0).expect("zero-length read should work"), &[]);
+        assert_eq!(
+            mmap.read_bytes(1, 3).expect("valid range should read"),
+            &bytes[1..4]
+        );
+        assert_eq!(
+            mmap.read_bytes(0, 0).expect("zero-length read should work"),
+            &[]
+        );
     }
 
     #[test]
@@ -146,7 +152,10 @@ mod tests {
 
         for (offset, len) in cases {
             assert!(
-                matches!(memory.read_bytes(offset, len), Err(BufferError::OutOfBounds)),
+                matches!(
+                    memory.read_bytes(offset, len),
+                    Err(BufferError::OutOfBounds)
+                ),
                 "memory buffer should return OutOfBounds for offset={offset}, len={len}"
             );
             assert!(

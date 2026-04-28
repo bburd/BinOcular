@@ -1,12 +1,28 @@
 use assert_cmd::cargo::*;
 use serde::Deserialize;
 use serde_json::Value;
+use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize)]
 struct Record {
     name: String,
+    offset: Option<u64>,
     value: Value,
+}
+
+fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should move forward")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "{prefix}_{}_{}.{}",
+        std::process::id(),
+        nanos,
+        extension
+    ))
 }
 
 #[test]
@@ -44,17 +60,76 @@ fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Err
     assert_eq!(records.len(), 4);
 
     assert_eq!(records[0].name, "magic");
+    assert_eq!(records[0].offset, Some(0));
     assert_eq!(records[0].value.as_u64(), Some(0x12345678));
 
     assert_eq!(records[1].name, "answer");
+    assert_eq!(records[1].offset, Some(4));
     assert_eq!(records[1].value.as_i64(), Some(42));
 
     assert_eq!(records[2].name, "value");
+    assert_eq!(records[2].offset, Some(8));
     let value = records[2].value.as_f64().ok_or("Expected float value")?;
     assert!((value - 1.0).abs() < f64::EPSILON);
 
     assert_eq!(records[3].name, "status");
+    assert_eq!(records[3].offset, Some(12));
     assert_eq!(records[3].value.as_str(), Some("OK!!"));
+
+    Ok(())
+}
+
+#[test]
+fn repeated_fields_emit_multiple_json_records() -> Result<(), Box<dyn std::error::Error>> {
+    let schema_path = unique_temp_path("repeat_schema", "yaml");
+    let bin_path = unique_temp_path("repeat_data", "bin");
+
+    let schema = r#"
+schema_name: "Repeat"
+schema_version: 1
+endianness: little
+fields:
+  - name: "value"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+    repeat:
+      count: 3
+"#;
+
+    fs::write(&schema_path, schema)?;
+    fs::write(&bin_path, [1_u8, 0, 2, 0, 3, 0])?;
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--schema",
+            schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    let _ = fs::remove_file(&schema_path);
+    let _ = fs::remove_file(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    assert_eq!(records.len(), 3);
+
+    assert_eq!(records[0].name, "value[0]");
+    assert_eq!(records[0].offset, Some(0));
+    assert_eq!(records[0].value.as_u64(), Some(1));
+
+    assert_eq!(records[1].name, "value[1]");
+    assert_eq!(records[1].offset, Some(2));
+    assert_eq!(records[1].value.as_u64(), Some(2));
+
+    assert_eq!(records[2].name, "value[2]");
+    assert_eq!(records[2].offset, Some(4));
+    assert_eq!(records[2].value.as_u64(), Some(3));
 
     Ok(())
 }

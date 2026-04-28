@@ -1,6 +1,8 @@
 use crate::ast::{FieldType, OffsetKind, Schema};
 use crate::error::SchemaError;
 
+pub const MAX_REPEAT_COUNT: u64 = 10_000;
+
 pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
     if schema.schema_name.trim().is_empty() {
         return Err(SchemaError::Validation(
@@ -30,10 +32,18 @@ pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
             )));
         }
 
-        if field.repeat.is_some() {
-            return Err(SchemaError::Validation(format!(
-                "{field_label} uses repeat, which is not allowed in schema v1"
-            )));
+        if let Some(repeat) = &field.repeat {
+            if repeat.count == 0 {
+                return Err(SchemaError::Validation(format!(
+                    "{field_label} has repeat count 0; count must be greater than 0"
+                )));
+            }
+            if repeat.count > MAX_REPEAT_COUNT {
+                return Err(SchemaError::Validation(format!(
+                    "{field_label} has repeat count {}; maximum supported count is {}",
+                    repeat.count, MAX_REPEAT_COUNT
+                )));
+            }
         }
 
         match field.ty {
@@ -135,11 +145,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_schema_rejects_repeat() {
+    fn validate_schema_accepts_repeat() {
         let mut schema = base_schema();
         schema.fields[0].repeat = Some(RepeatInfo { count: 2 });
+        assert!(validate_schema(&schema).is_ok());
+    }
+
+    #[test]
+    fn validate_schema_rejects_zero_repeat_count() {
+        let mut schema = base_schema();
+        schema.fields[0].repeat = Some(RepeatInfo { count: 0 });
         let err = validate_schema(&schema).unwrap_err();
-        assert!(err.to_string().contains("repeat"));
+        assert!(err.to_string().contains("repeat count 0"));
+    }
+
+    #[test]
+    fn validate_schema_rejects_repeat_count_over_max() {
+        let mut schema = base_schema();
+        schema.fields[0].repeat = Some(RepeatInfo {
+            count: MAX_REPEAT_COUNT + 1,
+        });
+        let err = validate_schema(&schema).unwrap_err();
+        assert!(err.to_string().contains("maximum supported count"));
     }
 
     #[test]
@@ -260,7 +287,7 @@ fields:
     }
 
     #[test]
-    fn parse_schema_rejects_repeat_usage() {
+    fn parse_schema_accepts_repeat_usage() {
         let yaml = r#"
 schema_name: "WithRepeat"
 schema_version: 1
@@ -275,7 +302,49 @@ fields:
       count: 2
 "#;
 
+        let schema = parse_schema_str(yaml).expect("repeat should be accepted");
+        assert_eq!(schema.fields[0].repeat.as_ref().map(|r| r.count), Some(2));
+    }
+
+    #[test]
+    fn parse_schema_rejects_zero_repeat_count() {
+        let yaml = r#"
+schema_name: "WithRepeat"
+schema_version: 1
+endianness: little
+fields:
+  - name: "values"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 0
+    repeat:
+      count: 0
+"#;
+
         expect_validation_error(yaml);
+    }
+
+    #[test]
+    fn parse_schema_rejects_repeat_count_over_max() {
+        let yaml = format!(
+            r#"
+schema_name: "WithRepeat"
+schema_version: 1
+endianness: little
+fields:
+  - name: "values"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 0
+    repeat:
+      count: {}
+"#,
+            MAX_REPEAT_COUNT + 1
+        );
+
+        expect_validation_error(&yaml);
     }
 
     fn arb_endianness() -> impl Strategy<Value = Endianness> {

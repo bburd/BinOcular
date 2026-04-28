@@ -14,6 +14,9 @@ pub enum FieldValue {
 #[derive(Debug, Clone)]
 pub struct FieldEval {
     pub field: FieldDef,
+    pub display_name: String,
+    pub resolved_offset: u64,
+    pub byte_len: usize,
     pub value: Option<FieldValue>,
     pub error: Option<String>,
 }
@@ -23,19 +26,18 @@ pub fn interpret_field<B: FileBuffer + ?Sized>(
     field: &FieldDef,
     schema: Option<&Schema>,
 ) -> Result<FieldValue, InterpretError> {
-    let len = match field.ty {
-        FieldType::U8 => 1,
-        FieldType::U16 => 2,
-        FieldType::U32 | FieldType::I32 | FieldType::F32 => 4,
-        FieldType::U64 => 8,
-        FieldType::Bytes | FieldType::Ascii => field.length.unwrap_or(0) as usize,
-    };
+    let len = field_byte_len(field);
+    let offset = resolve_base_offset(field)?;
+    interpret_field_at(buffer, field, schema, offset, len)
+}
 
-    let offset = match &field.offset {
-        OffsetKind::Absolute(o) => *o,
-        OffsetKind::Expr(_) => return Err(InterpretError::Unsupported),
-    };
-
+fn interpret_field_at<B: FileBuffer + ?Sized>(
+    buffer: &B,
+    field: &FieldDef,
+    schema: Option<&Schema>,
+    offset: u64,
+    len: usize,
+) -> Result<FieldValue, InterpretError> {
     let bytes = buffer.read_bytes(offset, len)?;
 
     let endianness = field
@@ -76,22 +78,91 @@ pub fn interpret_field<B: FileBuffer + ?Sized>(
 }
 
 pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> Vec<FieldEval> {
-    schema
-        .fields
-        .iter()
-        .map(|field| match interpret_field(buffer, field, Some(schema)) {
-            Ok(value) => FieldEval {
-                field: field.clone(),
-                value: Some(value),
-                error: None,
-            },
-            Err(err) => FieldEval {
-                field: field.clone(),
-                value: None,
-                error: Some(err.to_string()),
-            },
-        })
-        .collect()
+    let mut rows = Vec::new();
+
+    for field in &schema.fields {
+        let byte_len = field_byte_len(field);
+        let count = field.repeat.as_ref().map_or(1, |repeat| repeat.count);
+
+        for index in 0..count {
+            let display_name = if field.repeat.is_some() {
+                format!("{}[{index}]", field.name)
+            } else {
+                field.name.clone()
+            };
+
+            let resolved = resolve_repeated_offset(field, index, byte_len);
+            let resolved_offset = match resolved {
+                Ok(offset) => offset,
+                Err(err) => {
+                    rows.push(FieldEval {
+                        field: field.clone(),
+                        display_name,
+                        resolved_offset: 0,
+                        byte_len,
+                        value: None,
+                        error: Some(err.to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            let value = interpret_field_at(buffer, field, Some(schema), resolved_offset, byte_len);
+            match value {
+                Ok(value) => rows.push(FieldEval {
+                    field: field.clone(),
+                    display_name,
+                    resolved_offset,
+                    byte_len,
+                    value: Some(value),
+                    error: None,
+                }),
+                Err(err) => rows.push(FieldEval {
+                    field: field.clone(),
+                    display_name,
+                    resolved_offset,
+                    byte_len,
+                    value: None,
+                    error: Some(err.to_string()),
+                }),
+            }
+        }
+    }
+
+    rows
+}
+
+fn field_byte_len(field: &FieldDef) -> usize {
+    match field.ty {
+        FieldType::U8 => 1,
+        FieldType::U16 => 2,
+        FieldType::U32 | FieldType::I32 | FieldType::F32 => 4,
+        FieldType::U64 => 8,
+        FieldType::Bytes | FieldType::Ascii => field.length.unwrap_or(0) as usize,
+    }
+}
+
+fn resolve_base_offset(field: &FieldDef) -> Result<u64, InterpretError> {
+    match &field.offset {
+        OffsetKind::Absolute(offset) => Ok(*offset),
+        OffsetKind::Expr(_) => Err(InterpretError::Unsupported),
+    }
+}
+
+fn resolve_repeated_offset(
+    field: &FieldDef,
+    index: u64,
+    byte_len: usize,
+) -> Result<u64, InterpretError> {
+    let base_offset = resolve_base_offset(field)?;
+    let stride = u64::try_from(byte_len).map_err(|_| InterpretError::OffsetOverflow)?;
+    let repeated_bytes = index
+        .checked_mul(stride)
+        .ok_or(InterpretError::OffsetOverflow)?;
+
+    base_offset
+        .checked_add(repeated_bytes)
+        .ok_or(InterpretError::OffsetOverflow)
 }
 
 fn read_u16(bytes: &[u8], endianness: Endianness) -> Result<u16, InterpretError> {
@@ -228,11 +299,17 @@ mod tests {
 
         let first = &results[0];
         assert_eq!(first.field.name, "byte");
+        assert_eq!(first.display_name, "byte");
+        assert_eq!(first.resolved_offset, 0);
+        assert_eq!(first.byte_len, 1);
         assert!(first.error.is_none());
         assert_uint(first.value.clone().unwrap(), 0xDE);
 
         let second = &results[1];
         assert_eq!(second.field.name, "u32_fail");
+        assert_eq!(second.display_name, "u32_fail");
+        assert_eq!(second.resolved_offset, 1);
+        assert_eq!(second.byte_len, 4);
         assert!(second.value.is_none());
         let err = second.error.clone().expect("expected an error");
         assert!(err.contains("buffer error"));
@@ -432,5 +509,155 @@ mod tests {
 
         let err = interpret_field(&buffer, &field, None).unwrap_err();
         assert!(matches!(err, InterpretError::Unsupported));
+    }
+
+    #[test]
+    fn repeated_numeric_fields_expand_with_incremented_offsets() {
+        let buffer = MemoryBuffer::from_vec(vec![0x10, 0x20, 0x30]);
+        let schema = Schema {
+            schema_name: "repeat".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![FieldDef {
+                name: "byte".to_string(),
+                ty: FieldType::U8,
+                offset: OffsetKind::Absolute(0),
+                length: None,
+                endianness: None,
+                description: None,
+                repeat: Some(binocular_schema::ast::RepeatInfo { count: 3 }),
+            }],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results.len(), 3);
+
+        assert_eq!(results[0].display_name, "byte[0]");
+        assert_eq!(results[0].resolved_offset, 0);
+        assert_eq!(results[0].byte_len, 1);
+        assert_uint(results[0].value.clone().unwrap(), 0x10);
+
+        assert_eq!(results[1].display_name, "byte[1]");
+        assert_eq!(results[1].resolved_offset, 1);
+        assert_eq!(results[1].byte_len, 1);
+        assert_uint(results[1].value.clone().unwrap(), 0x20);
+
+        assert_eq!(results[2].display_name, "byte[2]");
+        assert_eq!(results[2].resolved_offset, 2);
+        assert_eq!(results[2].byte_len, 1);
+        assert_uint(results[2].value.clone().unwrap(), 0x30);
+    }
+
+    #[test]
+    fn repeated_ascii_and_bytes_use_declared_length_as_stride() {
+        let buffer = MemoryBuffer::from_vec(b"ABCDWXYZ".to_vec());
+        let schema = Schema {
+            schema_name: "repeat".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![FieldDef {
+                name: "chunk".to_string(),
+                ty: FieldType::Ascii,
+                offset: OffsetKind::Absolute(0),
+                length: Some(4),
+                endianness: None,
+                description: None,
+                repeat: Some(binocular_schema::ast::RepeatInfo { count: 2 }),
+            }],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].resolved_offset, 0);
+        assert_eq!(results[0].byte_len, 4);
+        assert_eq!(results[1].resolved_offset, 4);
+        assert_eq!(results[1].byte_len, 4);
+
+        match results[0].value.as_ref().unwrap() {
+            FieldValue::Ascii(value) => assert_eq!(value, "ABCD"),
+            other => panic!("expected Ascii, got {other:?}"),
+        }
+        match results[1].value.as_ref().unwrap() {
+            FieldValue::Ascii(value) => assert_eq!(value, "WXYZ"),
+            other => panic!("expected Ascii, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repeated_field_partial_failure_only_marks_failing_rows() {
+        let buffer = MemoryBuffer::from_vec(vec![0xAA, 0xBB]);
+        let schema = Schema {
+            schema_name: "repeat".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![FieldDef {
+                name: "pair".to_string(),
+                ty: FieldType::U8,
+                offset: OffsetKind::Absolute(1),
+                length: None,
+                endianness: None,
+                description: None,
+                repeat: Some(binocular_schema::ast::RepeatInfo { count: 3 }),
+            }],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results.len(), 3);
+
+        assert!(results[0].error.is_none());
+        assert_uint(results[0].value.clone().unwrap(), 0xBB);
+
+        assert!(results[1].value.is_none());
+        assert!(results[1]
+            .error
+            .as_ref()
+            .expect("expected error")
+            .contains("buffer error"));
+
+        assert!(results[2].value.is_none());
+        assert!(results[2]
+            .error
+            .as_ref()
+            .expect("expected error")
+            .contains("buffer error"));
+    }
+
+    #[test]
+    fn repeated_field_overflow_only_marks_overflowing_row() {
+        let buffer = MemoryBuffer::from_vec(vec![0xAB]);
+        let schema = Schema {
+            schema_name: "repeat".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![FieldDef {
+                name: "overflow".to_string(),
+                ty: FieldType::U16,
+                offset: OffsetKind::Absolute(u64::MAX - 1),
+                length: None,
+                endianness: None,
+                description: None,
+                repeat: Some(binocular_schema::ast::RepeatInfo { count: 2 }),
+            }],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results.len(), 2);
+
+        assert_eq!(results[0].display_name, "overflow[0]");
+        assert_eq!(results[0].resolved_offset, u64::MAX - 1);
+        assert!(results[0].value.is_none());
+        assert!(results[0]
+            .error
+            .as_ref()
+            .expect("expected error")
+            .contains("buffer error"));
+
+        assert_eq!(results[1].display_name, "overflow[1]");
+        assert_eq!(results[1].resolved_offset, 0);
+        assert!(results[1].value.is_none());
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("resolved offset overflowed during repeat expansion")
+        );
     }
 }

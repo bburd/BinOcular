@@ -11,6 +11,9 @@ pub enum InterpretError {
     #[error("buffer error: {0}")]
     Buffer(#[from] BufferError),
 
+    #[error("resolved offset overflowed during repeat expansion")]
+    OffsetOverflow,
+
     #[error("invalid numeric byte width: expected {expected}, got {actual}")]
     InvalidNumericByteWidth { expected: usize, actual: usize },
 

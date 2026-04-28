@@ -13,7 +13,7 @@ use std::process;
 use anyhow::Context;
 use binocular_core::buffer::MemoryBuffer;
 use binocular_core::interpret::{interpret_schema, FieldValue};
-use binocular_schema::ast::{FieldDef, FieldType, OffsetKind};
+use binocular_schema::ast::{FieldDef, FieldType};
 use binocular_schema::parser::parse_schema_str;
 use clap::Parser;
 use serde_json::json;
@@ -97,20 +97,13 @@ fn main() -> anyhow::Result<()> {
     let evaluations = interpret_schema(&buffer, &schema);
     let records: Vec<_> = evaluations
         .into_iter()
-        .map(|eval| {
-            let offset = match &eval.field.offset {
-                OffsetKind::Absolute(o) => Some(*o),
-                OffsetKind::Expr(_) => None,
-            };
-
-            FieldRecord {
-                name: eval.field.name.clone(),
-                offset,
-                offset_hex: offset.map(|o| format!("0x{o:08X}")),
-                field_type: render_field_type(&eval.field),
-                value: eval.value,
-                error: eval.error,
-            }
+        .map(|eval| FieldRecord {
+            name: eval.display_name,
+            offset: Some(eval.resolved_offset),
+            offset_hex: Some(format!("0x{:08X}", eval.resolved_offset)),
+            field_type: render_field_type(&eval.field, eval.byte_len),
+            value: eval.value,
+            error: eval.error,
         })
         .collect();
 
@@ -177,7 +170,7 @@ fn render_offset(offset: Option<u64>) -> String {
     }
 }
 
-fn render_field_type(field: &FieldDef) -> String {
+fn render_field_type(field: &FieldDef, byte_len: usize) -> String {
     match field.ty {
         FieldType::U8 => "u8".to_string(),
         FieldType::U16 => "u16".to_string(),
@@ -185,14 +178,8 @@ fn render_field_type(field: &FieldDef) -> String {
         FieldType::U64 => "u64".to_string(),
         FieldType::I32 => "i32".to_string(),
         FieldType::F32 => "f32".to_string(),
-        FieldType::Bytes => match field.length {
-            Some(length) => format!("bytes[{length}]"),
-            None => "bytes".to_string(),
-        },
-        FieldType::Ascii => match field.length {
-            Some(length) => format!("ascii[{length}]"),
-            None => "ascii".to_string(),
-        },
+        FieldType::Bytes => format!("bytes[{byte_len}]"),
+        FieldType::Ascii => format!("ascii[{byte_len}]"),
     }
 }
 
