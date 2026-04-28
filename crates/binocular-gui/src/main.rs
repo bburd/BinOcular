@@ -1,12 +1,13 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
-use binocular_core::buffer::{FileBuffer, MemoryBuffer};
+use binocular_core::buffer::{FileBuffer, MemoryBuffer, MmapBuffer};
 use binocular_core::interpret::{interpret_schema, FieldEval, FieldValue};
 use binocular_schema::ast::Schema;
 use binocular_schema::parser::parse_schema_str;
 use eframe::egui;
 
 const MAX_HEX_BYTES: usize = 256;
+const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 struct Document {
     _path: PathBuf,
@@ -98,8 +99,13 @@ impl BinOcularApp {
         }
 
         let size = metadata.len();
-        let data = fs::read(&path).map_err(|err| err.to_string())?;
-        let buffer: Arc<dyn FileBuffer> = Arc::new(MemoryBuffer::from_vec(data));
+        let buffer: Arc<dyn FileBuffer> = if size < MMAP_THRESHOLD_BYTES {
+            let data = fs::read(&path).map_err(|err| err.to_string())?;
+            Arc::new(MemoryBuffer::from_vec(data))
+        } else {
+            let mmap = MmapBuffer::open(&path).map_err(|err| err.to_string())?;
+            Arc::new(mmap)
+        };
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
