@@ -46,23 +46,23 @@ pub fn interpret_field<B: FileBuffer>(
     let value = match field.ty {
         FieldType::U8 => FieldValue::UInt(bytes[0] as u64),
         FieldType::U16 => {
-            let v = read_u16(bytes, endianness);
+            let v = read_u16(bytes, endianness)?;
             FieldValue::UInt(v as u64)
         }
         FieldType::U32 => {
-            let v = read_u32(bytes, endianness);
+            let v = read_u32(bytes, endianness)?;
             FieldValue::UInt(v as u64)
         }
         FieldType::U64 => {
-            let v = read_u64(bytes, endianness);
+            let v = read_u64(bytes, endianness)?;
             FieldValue::UInt(v)
         }
         FieldType::I32 => {
-            let v = read_i32(bytes, endianness);
+            let v = read_i32(bytes, endianness)?;
             FieldValue::Int(v as i64)
         }
         FieldType::F32 => {
-            let v = read_f32(bytes, endianness);
+            let v = read_f32(bytes, endianness)?;
             FieldValue::Float(v)
         }
         FieldType::Bytes => FieldValue::Bytes(bytes.to_vec()),
@@ -94,38 +94,73 @@ pub fn interpret_schema<B: FileBuffer>(buffer: &B, schema: &Schema) -> Vec<Field
         .collect()
 }
 
-fn read_u16(bytes: &[u8], endianness: Endianness) -> u16 {
+fn read_u16(bytes: &[u8], endianness: Endianness) -> Result<u16, InterpretError> {
+    let bytes: [u8; 2] = bytes
+        .try_into()
+        .map_err(|_| InterpretError::InvalidNumericByteWidth {
+            expected: 2,
+            actual: bytes.len(),
+        })?;
+
     match endianness {
-        Endianness::Little => u16::from_le_bytes(bytes.try_into().unwrap()),
-        Endianness::Big => u16::from_be_bytes(bytes.try_into().unwrap()),
+        Endianness::Little => Ok(u16::from_le_bytes(bytes)),
+        Endianness::Big => Ok(u16::from_be_bytes(bytes)),
     }
 }
 
-fn read_u32(bytes: &[u8], endianness: Endianness) -> u32 {
+fn read_u32(bytes: &[u8], endianness: Endianness) -> Result<u32, InterpretError> {
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| InterpretError::InvalidNumericByteWidth {
+            expected: 4,
+            actual: bytes.len(),
+        })?;
+
     match endianness {
-        Endianness::Little => u32::from_le_bytes(bytes.try_into().unwrap()),
-        Endianness::Big => u32::from_be_bytes(bytes.try_into().unwrap()),
+        Endianness::Little => Ok(u32::from_le_bytes(bytes)),
+        Endianness::Big => Ok(u32::from_be_bytes(bytes)),
     }
 }
 
-fn read_u64(bytes: &[u8], endianness: Endianness) -> u64 {
+fn read_u64(bytes: &[u8], endianness: Endianness) -> Result<u64, InterpretError> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| InterpretError::InvalidNumericByteWidth {
+            expected: 8,
+            actual: bytes.len(),
+        })?;
+
     match endianness {
-        Endianness::Little => u64::from_le_bytes(bytes.try_into().unwrap()),
-        Endianness::Big => u64::from_be_bytes(bytes.try_into().unwrap()),
+        Endianness::Little => Ok(u64::from_le_bytes(bytes)),
+        Endianness::Big => Ok(u64::from_be_bytes(bytes)),
     }
 }
 
-fn read_i32(bytes: &[u8], endianness: Endianness) -> i32 {
+fn read_i32(bytes: &[u8], endianness: Endianness) -> Result<i32, InterpretError> {
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| InterpretError::InvalidNumericByteWidth {
+            expected: 4,
+            actual: bytes.len(),
+        })?;
+
     match endianness {
-        Endianness::Little => i32::from_le_bytes(bytes.try_into().unwrap()),
-        Endianness::Big => i32::from_be_bytes(bytes.try_into().unwrap()),
+        Endianness::Little => Ok(i32::from_le_bytes(bytes)),
+        Endianness::Big => Ok(i32::from_be_bytes(bytes)),
     }
 }
 
-fn read_f32(bytes: &[u8], endianness: Endianness) -> f32 {
+fn read_f32(bytes: &[u8], endianness: Endianness) -> Result<f32, InterpretError> {
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| InterpretError::InvalidNumericByteWidth {
+            expected: 4,
+            actual: bytes.len(),
+        })?;
+
     match endianness {
-        Endianness::Little => f32::from_le_bytes(bytes.try_into().unwrap()),
-        Endianness::Big => f32::from_be_bytes(bytes.try_into().unwrap()),
+        Endianness::Little => Ok(f32::from_le_bytes(bytes)),
+        Endianness::Big => Ok(f32::from_be_bytes(bytes)),
     }
 }
 
