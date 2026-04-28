@@ -9,7 +9,7 @@
 BinOcular is a portable, cross-platform binary analysis toolkit written in Rust.  
 It provides a structured, declarative way to explore unknown binary formats, visualize data layouts, and build custom parsers — without guesswork or hex-editor archaeology.
 
-This workspace includes both a CLI and a GUI, with a long-term goal of becoming a fully extensible open-source binary inspection suite.
+This workspace includes both a CLI and a GUI, with a long-term goal of becoming a robust open-source binary inspection suite.
 
 ## Features
 
@@ -17,14 +17,16 @@ This workspace includes both a CLI and a GUI, with a long-term goal of becoming 
 - **Fast & Safe** — Rust’s safety guarantees without sacrificing performance  
 - **Schema-Driven** — Describe binary structures using a clean YAML layout format  
 - **Precise Visualization** — Offsets, endian behavior, integers, strings, blobs  
-- **Extensible** — Designed for future plugins, custom field types, and tooling  
+- **GUI Buffer Abstraction** — GUI reads through the same buffer layer used across the workspace  
+- **Large-File mmap Backend** — Memory-mapped backend for efficient access to large binaries  
+- **Windowed/Paged Hex View** — Hex display reads a page/window at a time instead of loading whole files  
 - **Developer-Friendly** — CLI output (table or JSON) for automation and testing  
 
 ## Project Status
 
 Active development (**v0.2.0**).  
 The core schema engine, interpreter, CLI, and GUI MVP are functional.  
-This release focused on hardening and crash resistance under malformed input.
+Current GUI architecture uses a buffer abstraction with a memory-mapped backend and a windowed/paged hex-view strategy for large files.
 
 ## v0.2.0 Hardening Summary
 
@@ -53,10 +55,32 @@ This release focused on hardening and crash resistance under malformed input.
 - [x] Schema parser + validation  
 - [x] CLI table + JSON output  
 - [x] GUI MVP (hex view + interpreted fields)  
-- [ ] Paging-backed hex viewer for large files  
+- [x] Paging-backed hex viewer for large files  
 - [x] Property tests and fuzzing hardening
 - [ ] Plugin/interface system  
 - [ ] Advanced schema features (arrays, expressions, nested structures)  
+
+
+## Scope (Current vs Out of Scope)
+
+BinOcular is currently **read-only**. It is a binary inspection tool, **not** a full hex editor.
+
+### In Scope (Current)
+
+- Schema-driven parsing and field interpretation
+- GUI buffer abstraction
+- mmap backend for large files
+- Windowed/paged hex viewing
+
+### Explicitly Out of Scope (Current)
+
+- Arrays/repeats
+- Nested schemas
+- Conditional fields
+- Plugins
+- Full virtual scrolling
+- Editing bytes
+- Binary diff
 
 ## Workspace Layout
 
