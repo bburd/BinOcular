@@ -9,7 +9,7 @@
 BinOcular is a portable, cross-platform binary analysis toolkit written in Rust.  
 It provides a structured, declarative way to explore unknown binary formats, visualize data layouts, and build custom parsers — without guesswork or hex-editor archaeology.
 
-This workspace includes both a CLI and a GUI, with a long-term goal of becoming a fully extensible open-source binary inspection suite.
+This workspace includes both a CLI and a GUI, with a long-term goal of becoming a robust open-source binary inspection suite.
 
 ## Features
 
@@ -17,14 +17,16 @@ This workspace includes both a CLI and a GUI, with a long-term goal of becoming 
 - **Fast & Safe** — Rust’s safety guarantees without sacrificing performance  
 - **Schema-Driven** — Describe binary structures using a clean YAML layout format  
 - **Precise Visualization** — Offsets, endian behavior, integers, strings, blobs  
-- **Extensible** — Designed for future plugins, custom field types, and tooling  
+- **GUI Buffer Abstraction** — GUI reads through the same buffer layer used across the workspace  
+- **Large File Support (v0.3)** — Memory-mapped backend for efficient access to large binaries  
+- **Paged Hex View** — Navigate large files via windowed paging (Prev/Next/Go to offset)  
 - **Developer-Friendly** — CLI output (table or JSON) for automation and testing  
 
 ## Project Status
 
-Active development (**v0.2.0**).  
+Active development (**v0.3.0**).  
 The core schema engine, interpreter, CLI, and GUI MVP are functional.  
-This release focused on hardening and crash resistance under malformed input.
+Current GUI architecture uses a buffer abstraction with a memory-mapped backend and a windowed/paged hex-view strategy for large files.
 
 ## v0.2.0 Hardening Summary
 
@@ -47,16 +49,63 @@ This release focused on hardening and crash resistance under malformed input.
 - No schema expansion
 - No UI changes
 
+
+## v0.3.0 Large-File Support
+
+**TL;DR:** v0.3.0 makes BinOcular scale.
+
+### What changed
+
+- Introduced buffer abstraction (`Arc<dyn FileBuffer>`)
+- Added `MmapBuffer` backend for large files
+- Implemented automatic file-loading strategy (memory for small, mmap for large)
+- Replaced preview hex view with windowed paging (Prev / Next / Go to offset)
+- Added correctness tests for mmap behavior and bounds handling
+
+### What it means
+
+- BinOcular can efficiently inspect large files without loading them entirely into memory
+- Hex view now supports navigation across the full file, not just a preview
+- Backends are interchangeable with identical behavior guarantees
+
+### What didn't change
+
+- Still read-only
+- No schema expansion
+- No plugins or editing features
+
 ## Roadmap (High-Level)
 
 - [x] Field interpreter & offset model  
 - [x] Schema parser + validation  
 - [x] CLI table + JSON output  
 - [x] GUI MVP (hex view + interpreted fields)  
-- [ ] Paging-backed hex viewer for large files  
-- [x] Property tests and fuzzing hardening
+- [x] Paging-backed hex viewer for large files  
+- [x] Property tests and crash-harness hardening
 - [ ] Plugin/interface system  
 - [ ] Advanced schema features (arrays, expressions, nested structures)  
+
+
+## Scope (Current vs Out of Scope)
+
+BinOcular is currently **read-only**. It is a binary inspection tool, **not** a full hex editor.
+
+### In Scope (Current)
+
+- Schema-driven parsing and field interpretation
+- GUI buffer abstraction
+- mmap backend for large files
+- Windowed/paged hex viewing
+
+### Explicitly Out of Scope (Current)
+
+- Arrays/repeats
+- Nested schemas
+- Conditional fields
+- Plugins
+- Full virtual scrolling
+- Editing bytes
+- Binary diff
 
 ## Workspace Layout
 
@@ -135,14 +184,14 @@ The GUI is a lightweight egui desktop application that can:
 
 - Open binary files
 - Load YAML schemas
-- Display a hex preview
+- Display and navigate paged hex windows
 - Show interpreted fields
 
 ```bash
 cargo run -p binocular-gui
 ```
 
-More advanced visualizations and large-file support are planned.
+More advanced visualizations are planned; current large-file handling uses mmap + paging in read-only mode.
 
 ## Contributing
 
