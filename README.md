@@ -24,7 +24,7 @@ This workspace includes both a CLI and a GUI, with a long-term goal of becoming 
 
 ## Project Status
 
-Active development (**v0.2.0**).  
+Active development (**v0.3.0**).  
 The core schema engine, interpreter, CLI, and GUI MVP are functional.  
 Current GUI architecture uses a buffer abstraction with a memory-mapped backend and a windowed/paged hex-view strategy for large files.
 
@@ -48,6 +48,31 @@ Current GUI architecture uses a buffer abstraction with a memory-mapped backend 
 - No new features
 - No schema expansion
 - No UI changes
+
+
+## v0.3.0 Large-File Support
+
+**TL;DR:** v0.3.0 makes BinOcular scale.
+
+### What changed
+
+- Introduced buffer abstraction (`Arc<dyn FileBuffer>`)
+- Added `MmapBuffer` backend for large files
+- Implemented automatic file-loading strategy (memory for small, mmap for large)
+- Replaced preview hex view with windowed paging (Prev / Next / Go to offset)
+- Added correctness tests for mmap behavior and bounds handling
+
+### What it means
+
+- BinOcular can efficiently inspect large files without loading them entirely into memory
+- Hex view now supports navigation across the full file, not just a preview
+- Backends are interchangeable with identical behavior guarantees
+
+### What didn't change
+
+- Still read-only
+- No schema expansion
+- No plugins or editing features
 
 ## Roadmap (High-Level)
 
@@ -159,14 +184,14 @@ The GUI is a lightweight egui desktop application that can:
 
 - Open binary files
 - Load YAML schemas
-- Display a hex preview
+- Display and navigate paged hex windows
 - Show interpreted fields
 
 ```bash
 cargo run -p binocular-gui
 ```
 
-More advanced visualizations and large-file support are planned.
+More advanced visualizations are planned; current large-file handling uses mmap + paging in read-only mode.
 
 ## Contributing
 
