@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct Record {
     name: String,
     offset: Option<u64>,
+    offset_hex: Option<String>,
     #[serde(rename = "type")]
     field_type: Option<String>,
     value: Value,
@@ -72,19 +73,23 @@ fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Err
 
     assert_eq!(records[0].name, "magic");
     assert_eq!(records[0].offset, Some(0));
+    assert_eq!(records[0].offset_hex.as_deref(), Some("0x00000000"));
     assert_eq!(records[0].value.as_u64(), Some(0x12345678));
 
     assert_eq!(records[1].name, "answer");
     assert_eq!(records[1].offset, Some(4));
+    assert_eq!(records[1].offset_hex.as_deref(), Some("0x00000004"));
     assert_eq!(records[1].value.as_i64(), Some(42));
 
     assert_eq!(records[2].name, "value");
     assert_eq!(records[2].offset, Some(8));
+    assert_eq!(records[2].offset_hex.as_deref(), Some("0x00000008"));
     let value = records[2].value.as_f64().ok_or("Expected float value")?;
     assert!((value - 1.0).abs() < f64::EPSILON);
 
     assert_eq!(records[3].name, "status");
     assert_eq!(records[3].offset, Some(12));
+    assert_eq!(records[3].offset_hex.as_deref(), Some("0x0000000C"));
     assert_eq!(records[3].value.as_str(), Some("OK!!"));
 
     Ok(())
@@ -192,10 +197,12 @@ fields:
 
     assert_eq!(records[0].name, "data_offset");
     assert_eq!(records[0].offset, Some(0));
+    assert_eq!(records[0].offset_hex.as_deref(), Some("0x00000000"));
     assert_eq!(records[0].value.as_u64(), Some(4));
 
     assert_eq!(records[1].name, "payload");
     assert_eq!(records[1].offset, Some(4));
+    assert_eq!(records[1].offset_hex.as_deref(), Some("0x00000004"));
     assert_eq!(records[1].value.as_str(), Some("TEST"));
 
     Ok(())
@@ -411,6 +418,54 @@ fields:
     assert_eq!(records[2].field_type.as_deref(), Some("ascii[3]"));
     assert_eq!(records[2].value.as_str(), Some("CAT"));
     assert_eq!(records[2].error, None);
+
+    Ok(())
+}
+
+#[test]
+fn invalid_dynamic_offset_serializes_as_null_offset() -> Result<(), Box<dyn std::error::Error>> {
+    let schema_path = unique_temp_path("invalid_dynamic_offset_schema", "yaml");
+    let bin_path = unique_temp_path("invalid_dynamic_offset_data", "bin");
+
+    let schema = r#"
+schema_name: "InvalidDynamicOffset"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: ascii
+    offset:
+      kind: FieldRef
+      value: "missing_offset"
+    length: 2
+"#;
+
+    fs::write(&schema_path, schema)?;
+    fs::write(&bin_path, [b'O', b'K'])?;
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--schema",
+            schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    remove_if_exists(&schema_path);
+    remove_if_exists(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].offset, None);
+    assert_eq!(records[0].offset_hex, None);
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some("missing dynamic offset reference `missing_offset`")
+    );
 
     Ok(())
 }

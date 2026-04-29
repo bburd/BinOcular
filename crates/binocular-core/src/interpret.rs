@@ -20,6 +20,7 @@ pub struct FieldEval {
     pub field: FieldDef,
     pub display_name: String,
     pub resolved_offset: u64,
+    pub offset_valid: bool,
     pub byte_len: usize,
     pub value: Option<FieldValue>,
     pub error: Option<String>,
@@ -118,6 +119,7 @@ pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> 
                         field: field.clone(),
                         display_name,
                         resolved_offset: 0,
+                        offset_valid: false,
                         byte_len: 0,
                         value: None,
                         error: Some(err.to_string()),
@@ -133,6 +135,7 @@ pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> 
                         field: field.clone(),
                         display_name,
                         resolved_offset,
+                        offset_valid: true,
                         byte_len: 0,
                         value: None,
                         error: Some(err.to_string()),
@@ -149,6 +152,7 @@ pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> 
                         field: field.clone(),
                         display_name,
                         resolved_offset,
+                        offset_valid: true,
                         byte_len,
                         value: Some(value),
                         error: None,
@@ -158,6 +162,7 @@ pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> 
                     field: field.clone(),
                     display_name,
                     resolved_offset,
+                    offset_valid: true,
                     byte_len,
                     value: None,
                     error: Some(err.to_string()),
@@ -545,6 +550,7 @@ mod tests {
         assert_eq!(first.field.name, "byte");
         assert_eq!(first.display_name, "byte");
         assert_eq!(first.resolved_offset, 0);
+        assert!(first.offset_valid);
         assert_eq!(first.byte_len, 1);
         assert!(first.error.is_none());
         assert_uint(first.value.clone().unwrap(), 0xDE);
@@ -553,6 +559,7 @@ mod tests {
         assert_eq!(second.field.name, "u32_fail");
         assert_eq!(second.display_name, "u32_fail");
         assert_eq!(second.resolved_offset, 1);
+        assert!(second.offset_valid);
         assert_eq!(second.byte_len, 4);
         assert!(second.value.is_none());
         let err = second.error.clone().expect("expected an error");
@@ -795,16 +802,19 @@ mod tests {
 
         assert_eq!(results[0].display_name, "byte[0]");
         assert_eq!(results[0].resolved_offset, 0);
+        assert!(results[0].offset_valid);
         assert_eq!(results[0].byte_len, 1);
         assert_uint(results[0].value.clone().unwrap(), 0x10);
 
         assert_eq!(results[1].display_name, "byte[1]");
         assert_eq!(results[1].resolved_offset, 1);
+        assert!(results[1].offset_valid);
         assert_eq!(results[1].byte_len, 1);
         assert_uint(results[1].value.clone().unwrap(), 0x20);
 
         assert_eq!(results[2].display_name, "byte[2]");
         assert_eq!(results[2].resolved_offset, 2);
+        assert!(results[2].offset_valid);
         assert_eq!(results[2].byte_len, 1);
         assert_uint(results[2].value.clone().unwrap(), 0x30);
     }
@@ -830,8 +840,10 @@ mod tests {
         let results = interpret_schema(&buffer, &schema);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].resolved_offset, 0);
+        assert!(results[0].offset_valid);
         assert_eq!(results[0].byte_len, 4);
         assert_eq!(results[1].resolved_offset, 4);
+        assert!(results[1].offset_valid);
         assert_eq!(results[1].byte_len, 4);
 
         match results[0].value.as_ref().unwrap() {
@@ -906,6 +918,7 @@ mod tests {
 
         assert_eq!(results[0].display_name, "overflow[0]");
         assert_eq!(results[0].resolved_offset, u64::MAX - 1);
+        assert!(results[0].offset_valid);
         assert!(results[0].value.is_none());
         assert!(results[0]
             .error
@@ -915,6 +928,7 @@ mod tests {
 
         assert_eq!(results[1].display_name, "overflow[1]");
         assert_eq!(results[1].resolved_offset, 0);
+        assert!(!results[1].offset_valid);
         assert!(results[1].value.is_none());
         assert_eq!(
             results[1].error.as_deref(),
@@ -1445,6 +1459,7 @@ mod tests {
         assert!(results[0].value.is_none());
         assert_eq!(results[0].byte_len, 0);
         assert_eq!(results[0].resolved_offset, 0);
+        assert!(!results[0].offset_valid);
         assert_eq!(
             results[0].error.as_deref(),
             Some("missing dynamic offset reference `missing`")
@@ -1471,6 +1486,7 @@ mod tests {
 
         let results = interpret_schema(&buffer, &schema);
         assert_eq!(results[0].resolved_offset, 0);
+        assert!(!results[0].offset_valid);
         assert_eq!(
             results[0].error.as_deref(),
             Some("missing expression reference `missing`")
@@ -1503,6 +1519,7 @@ mod tests {
             results[1].error.as_deref(),
             Some("field `label` cannot be used as a dynamic offset source")
         );
+        assert!(!results[1].offset_valid);
     }
 
     #[test]
@@ -1531,6 +1548,7 @@ mod tests {
             results[1].error.as_deref(),
             Some("field `label` cannot be used as an expression source")
         );
+        assert!(!results[1].offset_valid);
     }
 
     #[test]
@@ -1559,6 +1577,7 @@ mod tests {
             results[1].error.as_deref(),
             Some("field `data_offset` resolved to a negative dynamic offset")
         );
+        assert!(!results[1].offset_valid);
     }
 
     #[test]
@@ -1587,6 +1606,7 @@ mod tests {
             results[1].error.as_deref(),
             Some("expression resolved to a negative dynamic offset")
         );
+        assert!(!results[1].offset_valid);
     }
 
     #[test]
@@ -1611,6 +1631,7 @@ mod tests {
             results[0].error.as_deref(),
             Some("expression arithmetic overflowed")
         );
+        assert!(!results[0].offset_valid);
     }
 
     #[test]
@@ -1640,6 +1661,7 @@ mod tests {
             results[1].error.as_deref(),
             Some("field `label` cannot be used as a dynamic offset source")
         );
+        assert!(!results[1].offset_valid);
         assert_uint(results[2].value.clone().unwrap(), 0x1234);
     }
 
@@ -1670,6 +1692,58 @@ mod tests {
             results[1].error.as_deref(),
             Some("expression resolved to a negative dynamic offset")
         );
+        assert!(!results[1].offset_valid);
         assert_uint(results[2].value.clone().unwrap(), 0x1234);
+    }
+
+    #[test]
+    fn successful_offset_zero_stays_valid() {
+        let buffer = MemoryBuffer::from_vec(vec![b'O', b'K']);
+        let schema = Schema {
+            schema_name: "offset_zero".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![FieldDef {
+                name: "payload".to_string(),
+                ty: FieldType::Ascii,
+                offset: OffsetKind::Absolute(0),
+                length: Some(LengthSpec::Literal(2)),
+                endianness: None,
+                description: None,
+                repeat: None,
+            }],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results[0].resolved_offset, 0);
+        assert!(results[0].offset_valid);
+        assert!(results[0].error.is_none());
+    }
+
+    #[test]
+    fn buffer_failures_after_resolving_offset_keep_offset_valid() {
+        let buffer = MemoryBuffer::from_vec(vec![0xAA]);
+        let schema = Schema {
+            schema_name: "resolved_offset_buffer_error".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![FieldDef {
+                name: "payload".to_string(),
+                ty: FieldType::U16,
+                offset: OffsetKind::Absolute(0),
+                length: None,
+                endianness: None,
+                description: None,
+                repeat: None,
+            }],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results[0].resolved_offset, 0);
+        assert!(results[0].offset_valid);
+        assert!(results[0]
+            .error
+            .as_deref()
+            .is_some_and(|err| err.contains("buffer error")));
     }
 }

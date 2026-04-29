@@ -261,8 +261,12 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
     }
 }
 
-fn format_resolved_offset(offset: u64) -> String {
-    format!("0x{offset:X} ({offset})")
+fn format_resolved_offset(offset: u64, offset_valid: bool) -> String {
+    if offset_valid {
+        format!("0x{offset:X} ({offset})")
+    } else {
+        "<invalid>".to_string()
+    }
 }
 
 fn format_value(value: &FieldValue, byte_len: usize) -> String {
@@ -344,7 +348,11 @@ fn draw_field_table(
 
                 let response = ui.selectable_label(
                     is_selected,
-                    egui::RichText::new(format_resolved_offset(eval.resolved_offset)).monospace(),
+                    egui::RichText::new(format_resolved_offset(
+                        eval.resolved_offset,
+                        eval.offset_valid,
+                    ))
+                    .monospace(),
                 );
                 row_clicked |= response.clicked();
 
@@ -371,7 +379,7 @@ fn draw_field_table(
                     row_clicked |= response.clicked();
                 }
 
-                if row_clicked {
+                if row_clicked && eval.offset_valid {
                     eprintln!(
                         "field row clicked: name={} offset=0x{:X} len={}",
                         eval.display_name, eval.resolved_offset, eval.byte_len

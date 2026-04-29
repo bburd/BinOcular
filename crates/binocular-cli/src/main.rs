@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process;
 
 use anyhow::Context;
-use binocular_core::buffer::MemoryBuffer;
+use binocular_core::buffer::{FileBuffer, MemoryBuffer, MmapBuffer};
 use binocular_core::interpret::{interpret_schema, FieldValue};
 use binocular_schema::ast::{FieldDef, FieldType};
 use binocular_schema::parser::parse_schema_file;
@@ -19,6 +19,7 @@ use clap::Parser;
 use serde_json::json;
 
 const MAX_DISPLAY_BYTES: usize = 256;
+const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 const BANNER: &str = include_str!("../assets/ascii/banner.txt");
 const BADGE: &str = include_str!("../assets/ascii/badge.txt");
 const TAGLINE: &str = "BinOcular â€” Know your bytes. Donâ€™t guess them.";
@@ -87,7 +88,7 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .context("--schema is required unless --branding is set")?;
 
-    let file_bytes = fs::read(file)?;
+    let buffer = open_file_buffer(file)?;
     let schema = match parse_schema_file(schema) {
         Ok(schema) => schema,
         Err(err) => {
@@ -96,15 +97,15 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let buffer = MemoryBuffer::from_vec(file_bytes);
-
-    let evaluations = interpret_schema(&buffer, &schema);
+    let evaluations = interpret_schema(buffer.as_ref(), &schema);
     let records: Vec<_> = evaluations
         .into_iter()
         .map(|eval| FieldRecord {
             name: eval.display_name,
-            offset: Some(eval.resolved_offset),
-            offset_hex: Some(format!("0x{:08X}", eval.resolved_offset)),
+            offset: eval.offset_valid.then_some(eval.resolved_offset),
+            offset_hex: eval
+                .offset_valid
+                .then_some(format!("0x{:08X}", eval.resolved_offset)),
             field_type: render_field_type(&eval.field, eval.byte_len),
             byte_len: eval.byte_len,
             value: eval.value,
@@ -169,10 +170,20 @@ struct FieldRecord {
     error: Option<String>,
 }
 
+fn open_file_buffer(path: &PathBuf) -> anyhow::Result<Box<dyn FileBuffer>> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() < MMAP_THRESHOLD_BYTES {
+        let data = fs::read(path)?;
+        Ok(Box::new(MemoryBuffer::from_vec(data)))
+    } else {
+        Ok(Box::new(MmapBuffer::open(path)?))
+    }
+}
+
 fn render_offset(offset: Option<u64>) -> String {
     match offset {
         Some(value) => format!("{} (0x{value:08X})", value),
-        None => "-".to_string(),
+        None => "<invalid>".to_string(),
     }
 }
 

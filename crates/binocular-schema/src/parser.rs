@@ -179,10 +179,14 @@ pub fn parse_schema_str(yaml: &str) -> Result<Schema, SchemaError> {
 pub fn parse_schema_file(path: impl AsRef<Path>) -> Result<Schema, SchemaError> {
     let path = absolutize_path(path.as_ref())?;
     let mut stack = Vec::new();
-    parse_schema_file_inner(&path, &mut stack)
+    parse_schema_file_inner(&path, &mut stack, None)
 }
 
-fn parse_schema_file_inner(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Schema, SchemaError> {
+fn parse_schema_file_inner(
+    path: &Path,
+    stack: &mut Vec<PathBuf>,
+    root_endianness: Option<Endianness>,
+) -> Result<Schema, SchemaError> {
     let normalized = normalize_for_cycle(path)?;
 
     if let Some(cycle_start) = stack.iter().position(|seen| seen == &normalized) {
@@ -203,6 +207,12 @@ fn parse_schema_file_inner(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Sche
             source,
         })?;
         let raw = parse_raw_schema_str(&yaml)?;
+        let root_endianness = if stack.len() == 1 {
+            raw.endianness
+        } else {
+            root_endianness
+        };
+        validate_include_endianness(root_endianness, raw.endianness, &normalized)?;
         let base_dir = normalized
             .parent()
             .map(Path::to_path_buf)
@@ -214,7 +224,8 @@ fn parse_schema_file_inner(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Sche
                 RawFieldItem::Field(field) => fields.push(field),
                 RawFieldItem::Include { include } => {
                     let include_path = base_dir.join(include);
-                    let included_schema = parse_schema_file_inner(&include_path, stack)?;
+                    let included_schema =
+                        parse_schema_file_inner(&include_path, stack, root_endianness)?;
                     fields.extend(included_schema.fields);
                 }
             }
@@ -299,6 +310,25 @@ fn schema_from_raw(raw: RawSchema, mut fields: Vec<FieldDef>) -> Schema {
         endianness: raw.endianness,
         fields,
     }
+}
+
+fn validate_include_endianness(
+    root_endianness: Option<Endianness>,
+    schema_endianness: Option<Endianness>,
+    path: &Path,
+) -> Result<(), SchemaError> {
+    if let (Some(root), Some(schema)) = (root_endianness, schema_endianness) {
+        if root != schema {
+            return Err(SchemaError::Validation(format!(
+                "Included schema `{}` declares {:?} endianness, but root schema declares {:?}; schema-level defaults must match for includes in v1",
+                path.display(),
+                schema,
+                root
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn find_string_key<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a str> {
@@ -1203,6 +1233,117 @@ fields:
 
         let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
         assert!(matches!(err, SchemaError::Yaml(_)));
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_file_rejects_conflicting_include_endianness() {
+        let dir = temp_test_dir("include_endianness_conflict");
+        write_file(
+            dir.join("root.yaml"),
+            r#"
+schema_name: "Root"
+schema_version: 1
+endianness: little
+fields:
+  - include: "common.yaml"
+"#,
+        );
+        write_file(
+            dir.join("common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+endianness: big
+fields:
+  - name: "value"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+"#,
+        );
+
+        let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
+        assert!(matches!(err, SchemaError::Validation(_)));
+        let message = err.to_string();
+        assert!(message.contains("common.yaml"));
+        assert!(message.contains("Big"));
+        assert!(message.contains("Little"));
+        assert!(message.contains("must match for includes in v1"));
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_file_accepts_matching_include_endianness() {
+        let dir = temp_test_dir("include_endianness_match");
+        write_file(
+            dir.join("root.yaml"),
+            r#"
+schema_name: "Root"
+schema_version: 1
+endianness: little
+fields:
+  - include: "common.yaml"
+"#,
+        );
+        write_file(
+            dir.join("common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+endianness: little
+fields:
+  - name: "value"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+"#,
+        );
+
+        let schema =
+            parse_schema_file(dir.join("root.yaml")).expect("matching include should work");
+        assert_eq!(schema.fields.len(), 1);
+        assert_eq!(schema.fields[0].name, "value");
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_file_keeps_field_level_endianness_in_includes() {
+        let dir = temp_test_dir("include_field_endianness");
+        write_file(
+            dir.join("root.yaml"),
+            r#"
+schema_name: "Root"
+schema_version: 1
+fields:
+  - include: "common.yaml"
+"#,
+        );
+        write_file(
+            dir.join("common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+endianness: big
+fields:
+  - name: "value"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+    endianness: little
+"#,
+        );
+
+        let schema = parse_schema_file(dir.join("root.yaml"))
+            .expect("include without root default should work");
+        assert_eq!(schema.fields.len(), 1);
+        assert_eq!(schema.fields[0].endianness, Some(Endianness::Little));
 
         cleanup_test_dir(dir);
     }
