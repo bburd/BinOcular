@@ -16,11 +16,35 @@ pub enum Endianness {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IntExprOp {
+    Add,
+    Sub,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IntExpr {
+    Const {
+        #[serde(rename = "const")]
+        value: i64,
+    },
+    FieldRef {
+        field: String,
+    },
+    Binary {
+        op: IntExprOp,
+        left: Box<IntExpr>,
+        right: Box<IntExpr>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value")]
 pub enum OffsetKind {
     Absolute(u64),
     FieldRef(String),
-    Expr(String),
+    Expr(IntExpr),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +52,7 @@ pub enum OffsetKind {
 pub enum LengthSpec {
     Literal(u64),
     FieldRef { field: String },
+    Expr { expr: IntExpr },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

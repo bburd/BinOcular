@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use crate::buffer::FileBuffer;
 use crate::error::InterpretError;
-use binocular_schema::ast::{Endianness, FieldDef, FieldType, LengthSpec, OffsetKind, Schema};
+use binocular_schema::ast::{
+    Endianness, FieldDef, FieldType, IntExpr, LengthSpec, OffsetKind, Schema,
+};
 
 #[derive(Debug, Clone)]
 pub enum FieldValue {
@@ -179,7 +181,9 @@ fn fixed_field_byte_len(field: &FieldDef) -> Result<usize, InterpretError> {
                     field: field.name.clone(),
                 })
             }
-            Some(LengthSpec::FieldRef { .. }) => Err(InterpretError::Unsupported),
+            Some(LengthSpec::FieldRef { .. } | LengthSpec::Expr { .. }) => {
+                Err(InterpretError::Unsupported)
+            }
             None => Ok(0),
         },
     }
@@ -189,7 +193,7 @@ fn resolve_base_offset(field: &FieldDef, context: &FieldContext) -> Result<u64, 
     match &field.offset {
         OffsetKind::Absolute(offset) => Ok(*offset),
         OffsetKind::FieldRef(referenced) => resolve_dynamic_offset(referenced, context),
-        OffsetKind::Expr(_) => Err(InterpretError::Unsupported),
+        OffsetKind::Expr(expr) => resolve_offset_expr(expr, context),
     }
 }
 
@@ -207,9 +211,73 @@ fn resolve_field_byte_len(
             Some(LengthSpec::FieldRef { field: referenced }) => {
                 resolve_dynamic_length(referenced, context)
             }
+            Some(LengthSpec::Expr { expr }) => resolve_length_expr(expr, context),
             None => Ok(0),
         },
         _ => fixed_field_byte_len(field),
+    }
+}
+
+fn resolve_length_expr(expr: &IntExpr, context: &FieldContext) -> Result<usize, InterpretError> {
+    let value = eval_int_expr(expr, context)?;
+    if value < 0 {
+        return Err(InterpretError::NegativeExpressionLength);
+    }
+    if value == 0 {
+        return Err(InterpretError::ZeroExpressionLength);
+    }
+
+    usize::try_from(value as u64).map_err(|_| InterpretError::ExpressionLengthOverflow)
+}
+
+fn resolve_offset_expr(expr: &IntExpr, context: &FieldContext) -> Result<u64, InterpretError> {
+    let value = eval_int_expr(expr, context)?;
+    if value < 0 {
+        return Err(InterpretError::NegativeExpressionOffset);
+    }
+
+    Ok(value as u64)
+}
+
+fn eval_int_expr(expr: &IntExpr, context: &FieldContext) -> Result<i64, InterpretError> {
+    match expr {
+        IntExpr::Const { value } => Ok(*value),
+        IntExpr::FieldRef { field } => resolve_expression_reference(field, context),
+        IntExpr::Binary { op, left, right } => {
+            let left = eval_int_expr(left, context)?;
+            let right = eval_int_expr(right, context)?;
+
+            match op {
+                binocular_schema::ast::IntExprOp::Add => left
+                    .checked_add(right)
+                    .ok_or(InterpretError::ExpressionOverflow),
+                binocular_schema::ast::IntExprOp::Sub => left
+                    .checked_sub(right)
+                    .ok_or(InterpretError::ExpressionOverflow),
+            }
+        }
+    }
+}
+
+fn resolve_expression_reference(
+    referenced: &str,
+    context: &FieldContext,
+) -> Result<i64, InterpretError> {
+    let Some(value) = context.get(referenced).copied() else {
+        return Err(InterpretError::MissingExpressionReference {
+            field: referenced.to_string(),
+        });
+    };
+
+    match value {
+        ContextValue::NonNumeric => Err(InterpretError::InvalidExpressionReferenceType {
+            field: referenced.to_string(),
+        }),
+        ContextValue::Numeric(NumericContextValue::Unsigned(value)) => i64::try_from(value)
+            .map_err(|_| InterpretError::ExpressionReferenceOverflow {
+                field: referenced.to_string(),
+            }),
+        ContextValue::Numeric(NumericContextValue::Signed(value)) => Ok(value),
     }
 }
 
@@ -375,7 +443,9 @@ fn read_f32(bytes: &[u8], endianness: Endianness) -> Result<f32, InterpretError>
 mod tests {
     use super::*;
     use crate::buffer::MemoryBuffer;
-    use binocular_schema::ast::{Endianness, FieldDef, FieldType, LengthSpec, OffsetKind, Schema};
+    use binocular_schema::ast::{
+        Endianness, FieldDef, FieldType, IntExpr, IntExprOp, LengthSpec, OffsetKind, Schema,
+    };
 
     fn make_field(
         name: &str,
@@ -403,6 +473,32 @@ mod tests {
             endianness: None,
             description: None,
             repeat: None,
+        }
+    }
+
+    fn expr_const(value: i64) -> IntExpr {
+        IntExpr::Const { value }
+    }
+
+    fn expr_field(field: &str) -> IntExpr {
+        IntExpr::FieldRef {
+            field: field.to_string(),
+        }
+    }
+
+    fn expr_add(left: IntExpr, right: IntExpr) -> IntExpr {
+        IntExpr::Binary {
+            op: IntExprOp::Add,
+            left: Box::new(left),
+            right: Box::new(right),
+        }
+    }
+
+    fn expr_sub(left: IntExpr, right: IntExpr) -> IntExpr {
+        IntExpr::Binary {
+            op: IntExprOp::Sub,
+            left: Box::new(left),
+            right: Box::new(right),
         }
     }
 
@@ -643,12 +739,29 @@ mod tests {
     }
 
     #[test]
-    fn expr_offset_is_unsupported() {
+    fn interpret_field_supports_const_only_expression_offset() {
         let buffer = MemoryBuffer::from_vec(vec![0x00, 0x01, 0x02, 0x03]);
         let field = FieldDef {
             name: "expr".to_string(),
             ty: FieldType::U8,
-            offset: OffsetKind::Expr("1 + 1".to_string()),
+            offset: OffsetKind::Expr(expr_add(expr_const(1), expr_const(1))),
+            length: None,
+            endianness: None,
+            description: None,
+            repeat: None,
+        };
+
+        let value = interpret_field(&buffer, &field, None).unwrap();
+        assert_uint(value, 0x02);
+    }
+
+    #[test]
+    fn interpret_field_rejects_expression_field_refs_without_context() {
+        let buffer = MemoryBuffer::from_vec(vec![0x00, 0x01, 0x02, 0x03]);
+        let field = FieldDef {
+            name: "expr".to_string(),
+            ty: FieldType::U8,
+            offset: OffsetKind::Expr(expr_field("base")),
             length: None,
             endianness: None,
             description: None,
@@ -656,7 +769,7 @@ mod tests {
         };
 
         let err = interpret_field(&buffer, &field, None).unwrap_err();
-        assert!(matches!(err, InterpretError::Unsupported));
+        assert_eq!(err.to_string(), "missing expression reference `base`");
     }
 
     #[test]
@@ -867,6 +980,34 @@ mod tests {
     }
 
     #[test]
+    fn expression_length_resolves_from_previous_field_minus_constant() {
+        let buffer = MemoryBuffer::from_vec(vec![7, 0, b'C', b'A', b'T']);
+        let schema = Schema {
+            schema_name: "expr_length".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("block_len", FieldType::U16, 0, None),
+                make_sized_field(
+                    "payload",
+                    FieldType::Ascii,
+                    2,
+                    LengthSpec::Expr {
+                        expr: expr_sub(expr_field("block_len"), expr_const(4)),
+                    },
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results[1].byte_len, 3);
+        match results[1].value.as_ref().unwrap() {
+            FieldValue::Ascii(value) => assert_eq!(value, "CAT"),
+            other => panic!("expected Ascii, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn dynamic_length_can_reference_repeated_numeric_display_name() {
         let buffer = MemoryBuffer::from_vec(vec![2, 0, 3, 0, b'H', b'E', b'Y']);
         let schema = Schema {
@@ -929,6 +1070,30 @@ mod tests {
     }
 
     #[test]
+    fn expression_length_missing_reference_becomes_row_error() {
+        let buffer = MemoryBuffer::from_vec(vec![b'O', b'K']);
+        let schema = Schema {
+            schema_name: "missing_expr_ref".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![make_sized_field(
+                "payload",
+                FieldType::Ascii,
+                0,
+                LengthSpec::Expr {
+                    expr: expr_sub(expr_field("missing"), expr_const(1)),
+                },
+            )],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some("missing expression reference `missing`")
+        );
+    }
+
+    #[test]
     fn dynamic_length_rejects_non_numeric_reference_source() {
         let buffer = MemoryBuffer::from_vec(vec![b'O', b'K', b'A', b'Y']);
         let schema = Schema {
@@ -952,6 +1117,33 @@ mod tests {
         assert_eq!(
             results[1].error.as_deref(),
             Some("field `label` cannot be used as a dynamic length source")
+        );
+    }
+
+    #[test]
+    fn expression_length_rejects_non_numeric_reference_source() {
+        let buffer = MemoryBuffer::from_vec(vec![b'O', b'K', b'A', b'Y']);
+        let schema = Schema {
+            schema_name: "expr_non_numeric_ref".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![
+                make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
+                make_sized_field(
+                    "payload",
+                    FieldType::Ascii,
+                    2,
+                    LengthSpec::Expr {
+                        expr: expr_add(expr_field("label"), expr_const(1)),
+                    },
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `label` cannot be used as an expression source")
         );
     }
 
@@ -1010,6 +1202,83 @@ mod tests {
     }
 
     #[test]
+    fn expression_length_rejects_negative_result() {
+        let buffer = MemoryBuffer::from_vec(vec![3, 0]);
+        let schema = Schema {
+            schema_name: "expr_negative_length".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("len", FieldType::U16, 0, None),
+                make_sized_field(
+                    "payload",
+                    FieldType::Ascii,
+                    2,
+                    LengthSpec::Expr {
+                        expr: expr_sub(expr_field("len"), expr_const(4)),
+                    },
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("expression resolved to a negative dynamic length")
+        );
+    }
+
+    #[test]
+    fn expression_length_rejects_zero_result() {
+        let buffer = MemoryBuffer::from_vec(vec![4, 0]);
+        let schema = Schema {
+            schema_name: "expr_zero_length".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("len", FieldType::U16, 0, None),
+                make_sized_field(
+                    "payload",
+                    FieldType::Ascii,
+                    2,
+                    LengthSpec::Expr {
+                        expr: expr_sub(expr_field("len"), expr_const(4)),
+                    },
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("expression resolved to a zero dynamic length")
+        );
+    }
+
+    #[test]
+    fn expression_length_rejects_arithmetic_overflow() {
+        let schema = Schema {
+            schema_name: "expr_overflow".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![make_sized_field(
+                "payload",
+                FieldType::Ascii,
+                0,
+                LengthSpec::Expr {
+                    expr: expr_add(expr_const(i64::MAX), expr_const(1)),
+                },
+            )],
+        };
+
+        let results = interpret_schema(&MemoryBuffer::from_vec(vec![b'O']), &schema);
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some("expression arithmetic overflowed")
+        );
+    }
+
+    #[test]
     fn dynamic_length_failure_does_not_block_later_fields() {
         let buffer = MemoryBuffer::from_vec(vec![b'A', b'B', 0x34, 0x12]);
         let schema = Schema {
@@ -1034,6 +1303,35 @@ mod tests {
         assert_eq!(
             results[1].error.as_deref(),
             Some("field `label` cannot be used as a dynamic length source")
+        );
+        assert_uint(results[2].value.clone().unwrap(), 0x1234);
+    }
+
+    #[test]
+    fn expression_length_failure_does_not_block_later_fields() {
+        let buffer = MemoryBuffer::from_vec(vec![2, 0, 0x34, 0x12]);
+        let schema = Schema {
+            schema_name: "continue_after_expr_error".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("len", FieldType::U16, 0, None),
+                make_sized_field(
+                    "payload",
+                    FieldType::Bytes,
+                    0,
+                    LengthSpec::Expr {
+                        expr: expr_sub(expr_field("len"), expr_const(4)),
+                    },
+                ),
+                make_field("tail", FieldType::U16, 2, None),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("expression resolved to a negative dynamic length")
         );
         assert_uint(results[2].value.clone().unwrap(), 0x1234);
     }
@@ -1097,6 +1395,35 @@ mod tests {
     }
 
     #[test]
+    fn expression_offset_resolves_from_previous_field_plus_constant() {
+        let buffer = MemoryBuffer::from_vec(vec![4, 0, 0, 0, 0xAA, 0xBB, b'D', b'A', b'T', b'A']);
+        let schema = Schema {
+            schema_name: "expr_offset".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("data_offset", FieldType::U32, 0, None),
+                FieldDef {
+                    name: "payload".to_string(),
+                    ty: FieldType::Ascii,
+                    offset: OffsetKind::Expr(expr_add(expr_field("data_offset"), expr_const(2))),
+                    length: Some(LengthSpec::Literal(4)),
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                },
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results[1].resolved_offset, 6);
+        match results[1].value.as_ref().unwrap() {
+            FieldValue::Ascii(value) => assert_eq!(value, "DATA"),
+            other => panic!("expected Ascii, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn dynamic_offset_missing_reference_becomes_row_error() {
         let buffer = MemoryBuffer::from_vec(vec![b'O', b'K']);
         let schema = Schema {
@@ -1121,6 +1448,32 @@ mod tests {
         assert_eq!(
             results[0].error.as_deref(),
             Some("missing dynamic offset reference `missing`")
+        );
+    }
+
+    #[test]
+    fn expression_offset_missing_reference_becomes_row_error() {
+        let buffer = MemoryBuffer::from_vec(vec![b'O', b'K']);
+        let schema = Schema {
+            schema_name: "missing_expr_offset_ref".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![FieldDef {
+                name: "payload".to_string(),
+                ty: FieldType::Ascii,
+                offset: OffsetKind::Expr(expr_add(expr_field("missing"), expr_const(1))),
+                length: Some(LengthSpec::Literal(2)),
+                endianness: None,
+                description: None,
+                repeat: None,
+            }],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results[0].resolved_offset, 0);
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some("missing expression reference `missing`")
         );
     }
 
@@ -1153,6 +1506,34 @@ mod tests {
     }
 
     #[test]
+    fn expression_offset_rejects_non_numeric_reference_source() {
+        let buffer = MemoryBuffer::from_vec(vec![b'O', b'K', b'A', b'Y']);
+        let schema = Schema {
+            schema_name: "expr_non_numeric_offset_ref".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![
+                make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
+                FieldDef {
+                    name: "payload".to_string(),
+                    ty: FieldType::Ascii,
+                    offset: OffsetKind::Expr(expr_add(expr_field("label"), expr_const(1))),
+                    length: Some(LengthSpec::Literal(2)),
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                },
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `label` cannot be used as an expression source")
+        );
+    }
+
+    #[test]
     fn dynamic_offset_rejects_negative_i32_reference() {
         let buffer = MemoryBuffer::from_vec(vec![255, 255, 255, 255, b'O']);
         let schema = Schema {
@@ -1177,6 +1558,58 @@ mod tests {
         assert_eq!(
             results[1].error.as_deref(),
             Some("field `data_offset` resolved to a negative dynamic offset")
+        );
+    }
+
+    #[test]
+    fn expression_offset_rejects_negative_result() {
+        let buffer = MemoryBuffer::from_vec(vec![2, 0, 0, 0, b'O']);
+        let schema = Schema {
+            schema_name: "negative_expr_offset".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("data_offset", FieldType::I32, 0, None),
+                FieldDef {
+                    name: "payload".to_string(),
+                    ty: FieldType::Ascii,
+                    offset: OffsetKind::Expr(expr_sub(expr_field("data_offset"), expr_const(4))),
+                    length: Some(LengthSpec::Literal(1)),
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                },
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("expression resolved to a negative dynamic offset")
+        );
+    }
+
+    #[test]
+    fn expression_offset_rejects_arithmetic_overflow() {
+        let schema = Schema {
+            schema_name: "expr_offset_overflow".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![FieldDef {
+                name: "payload".to_string(),
+                ty: FieldType::Ascii,
+                offset: OffsetKind::Expr(expr_add(expr_const(i64::MAX), expr_const(1))),
+                length: Some(LengthSpec::Literal(1)),
+                endianness: None,
+                description: None,
+                repeat: None,
+            }],
+        };
+
+        let results = interpret_schema(&MemoryBuffer::from_vec(vec![b'O']), &schema);
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some("expression arithmetic overflowed")
         );
     }
 
@@ -1206,6 +1639,36 @@ mod tests {
         assert_eq!(
             results[1].error.as_deref(),
             Some("field `label` cannot be used as a dynamic offset source")
+        );
+        assert_uint(results[2].value.clone().unwrap(), 0x1234);
+    }
+
+    #[test]
+    fn expression_offset_failure_does_not_block_later_fields() {
+        let buffer = MemoryBuffer::from_vec(vec![2, 0, 0x34, 0x12]);
+        let schema = Schema {
+            schema_name: "continue_after_expr_offset_error".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("offset_base", FieldType::U16, 0, None),
+                FieldDef {
+                    name: "payload".to_string(),
+                    ty: FieldType::Bytes,
+                    offset: OffsetKind::Expr(expr_sub(expr_field("offset_base"), expr_const(4))),
+                    length: Some(LengthSpec::Literal(1)),
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                },
+                make_field("tail", FieldType::U16, 2, None),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("expression resolved to a negative dynamic offset")
         );
         assert_uint(results[2].value.clone().unwrap(), 0x1234);
     }

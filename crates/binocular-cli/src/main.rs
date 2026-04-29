@@ -254,7 +254,10 @@ fn render_ascii(text: &str, byte_len: usize, full_bytes: bool, quote_ascii: bool
     let rendered = if full_bytes || byte_len <= MAX_DISPLAY_BYTES {
         render_ascii_preview(text, usize::MAX)
     } else {
-        format!("{}... ({byte_len} bytes)", render_ascii_preview(text, MAX_DISPLAY_BYTES))
+        format!(
+            "{}... ({byte_len} bytes)",
+            render_ascii_preview(text, MAX_DISPLAY_BYTES)
+        )
     };
 
     maybe_quote(rendered, quote_ascii)

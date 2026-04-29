@@ -338,6 +338,84 @@ fn dynamic_length_schema_outputs_expected_payload() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn expression_offset_and_length_schema_outputs_resolved_runtime_values(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema_path = unique_temp_path("expression_schema", "yaml");
+    let bin_path = unique_temp_path("expression_data", "bin");
+
+    let schema = r#"
+schema_name: "ExpressionExample"
+schema_version: 1
+endianness: little
+fields:
+  - name: "data_offset"
+    type: u32
+    offset:
+      kind: Absolute
+      value: 0
+  - name: "block_len"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 4
+  - name: "payload"
+    type: ascii
+    offset:
+      kind: Expr
+      value:
+        op: add
+        left:
+          field: "data_offset"
+        right:
+          const: 2
+    length:
+      expr:
+        op: sub
+        left:
+          field: "block_len"
+        right:
+          const: 4
+"#;
+
+    fs::write(&schema_path, schema)?;
+    fs::write(&bin_path, [4_u8, 0, 0, 0, 7, 0, b'C', b'A', b'T'])?;
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--schema",
+            schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    remove_if_exists(&schema_path);
+    remove_if_exists(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    assert_eq!(records.len(), 3);
+
+    assert_eq!(records[0].name, "data_offset");
+    assert_eq!(records[0].offset, Some(0));
+    assert_eq!(records[0].value.as_u64(), Some(4));
+
+    assert_eq!(records[1].name, "block_len");
+    assert_eq!(records[1].offset, Some(4));
+    assert_eq!(records[1].value.as_u64(), Some(7));
+
+    assert_eq!(records[2].name, "payload");
+    assert_eq!(records[2].offset, Some(6));
+    assert_eq!(records[2].field_type.as_deref(), Some("ascii[3]"));
+    assert_eq!(records[2].value.as_str(), Some("CAT"));
+    assert_eq!(records[2].error, None);
+
+    Ok(())
+}
+
+#[test]
 fn json_mode_emits_raw_json_without_branding() -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -572,11 +650,17 @@ fields:
     remove_if_exists(&ascii_schema_path);
     remove_if_exists(&ascii_bin_path);
 
-    assert!(ascii_output.status.success(), "CLI did not exit successfully");
+    assert!(
+        ascii_output.status.success(),
+        "CLI did not exit successfully"
+    );
 
     let ascii_stdout = String::from_utf8(ascii_output.stdout)?;
     let ascii_records: Vec<Record> = serde_json::from_str(&ascii_stdout)?;
-    assert_eq!(ascii_records[0].value.as_str(), Some(ascii_payload.as_str()));
+    assert_eq!(
+        ascii_records[0].value.as_str(),
+        Some(ascii_payload.as_str())
+    );
 
     let bytes_schema_path = unique_temp_path("full_bytes_schema", "yaml");
     let bytes_bin_path = unique_temp_path("full_bytes_data", "bin");
@@ -609,7 +693,10 @@ fields:
     remove_if_exists(&bytes_schema_path);
     remove_if_exists(&bytes_bin_path);
 
-    assert!(bytes_output.status.success(), "CLI did not exit successfully");
+    assert!(
+        bytes_output.status.success(),
+        "CLI did not exit successfully"
+    );
 
     let bytes_stdout = String::from_utf8(bytes_output.stdout)?;
     let bytes_records: Vec<Record> = serde_json::from_str(&bytes_stdout)?;
@@ -661,8 +748,14 @@ fields:
     remove_if_exists(&schema_path);
     remove_if_exists(&bin_path);
 
-    assert!(json_output.status.success(), "CLI did not exit successfully");
-    assert!(table_output.status.success(), "CLI did not exit successfully");
+    assert!(
+        json_output.status.success(),
+        "CLI did not exit successfully"
+    );
+    assert!(
+        table_output.status.success(),
+        "CLI did not exit successfully"
+    );
 
     let json_stdout = String::from_utf8(json_output.stdout)?;
     let records: Vec<Record> = serde_json::from_str(&json_stdout)?;
@@ -674,4 +767,3 @@ fields:
 
     Ok(())
 }
-

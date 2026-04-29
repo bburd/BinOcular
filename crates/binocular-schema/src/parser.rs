@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
-use crate::ast::{Endianness, FieldDef, FieldType, LengthSpec, OffsetKind, Schema};
+use crate::ast::{Endianness, FieldDef, FieldType, IntExpr, LengthSpec, OffsetKind, Schema};
 use crate::error::SchemaError;
 
 pub const MAX_REPEAT_COUNT: u64 = 10_000;
@@ -70,9 +70,13 @@ pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
                 }
             }
             OffsetKind::Expr(expr) => {
-                return Err(SchemaError::Validation(format!(
-                    "{field_label} uses expression offset `{expr}`, which is not supported in schema v1"
-                )));
+                validate_int_expr(expr, &field_label, "offset")?;
+
+                if field.repeat.is_some() {
+                    return Err(SchemaError::Validation(format!(
+                        "{field_label} cannot use dynamic offset together with repeat in schema v1"
+                    )));
+                }
             }
         }
 
@@ -110,6 +114,15 @@ pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
                         )));
                     }
                 }
+                Some(LengthSpec::Expr { expr }) => {
+                    validate_int_expr(expr, &field_label, "length")?;
+
+                    if field.repeat.is_some() {
+                        return Err(SchemaError::Validation(format!(
+                            "{field_label} cannot use dynamic length together with repeat in schema v1"
+                        )));
+                    }
+                }
                 None => {
                     return Err(SchemaError::Validation(format!(
                         "{field_label} must specify length for type {:?}",
@@ -129,6 +142,25 @@ pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
     }
 
     Ok(())
+}
+
+fn validate_int_expr(expr: &IntExpr, field_label: &str, usage: &str) -> Result<(), SchemaError> {
+    match expr {
+        IntExpr::Const { .. } => Ok(()),
+        IntExpr::FieldRef { field } => {
+            if field.trim().is_empty() {
+                Err(SchemaError::Validation(format!(
+                    "{field_label} references an empty {usage} expression field name"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        IntExpr::Binary { left, right, .. } => {
+            validate_int_expr(left, field_label, usage)?;
+            validate_int_expr(right, field_label, usage)
+        }
+    }
 }
 
 pub fn parse_schema_str(yaml: &str) -> Result<Schema, SchemaError> {
@@ -295,7 +327,7 @@ fn normalize_for_cycle(path: &Path) -> Result<PathBuf, SchemaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{FieldDef, RepeatInfo};
+    use crate::ast::{FieldDef, IntExprOp, RepeatInfo};
     use proptest::prelude::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -350,9 +382,11 @@ mod tests {
     #[test]
     fn validate_schema_rejects_expr_offset() {
         let mut schema = base_schema();
-        schema.fields[0].offset = OffsetKind::Expr("a+b".into());
+        schema.fields[0].offset = OffsetKind::Expr(IntExpr::FieldRef { field: "".into() });
         let err = validate_schema(&schema).unwrap_err();
-        assert!(err.to_string().contains("uses expression offset"));
+        assert!(err
+            .to_string()
+            .contains("empty offset expression field name"));
     }
 
     #[test]
@@ -506,6 +540,44 @@ fields:
     }
 
     #[test]
+    fn parse_schema_accepts_expression_length() {
+        let yaml = r#"
+schema_name: "ExprLength"
+schema_version: 1
+endianness: little
+fields:
+  - name: "block_len"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 2
+    length:
+      expr:
+        op: sub
+        left:
+          field: "block_len"
+        right:
+          const: 4
+"#;
+
+        let schema = parse_schema_str(yaml).expect("expression length should parse");
+        assert!(matches!(
+            schema.fields[1].length,
+            Some(LengthSpec::Expr {
+                expr: IntExpr::Binary {
+                    op: IntExprOp::Sub,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
     fn parse_schema_accepts_dynamic_offset() {
         let yaml = r#"
 schema_name: "DynamicOffset"
@@ -533,6 +605,41 @@ fields:
     }
 
     #[test]
+    fn parse_schema_accepts_expression_offset() {
+        let yaml = r#"
+schema_name: "ExprOffset"
+schema_version: 1
+endianness: little
+fields:
+  - name: "data_offset"
+    type: u32
+    offset:
+      kind: Absolute
+      value: 0
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Expr
+      value:
+        op: add
+        left:
+          field: "data_offset"
+        right:
+          const: 4
+    length: 4
+"#;
+
+        let schema = parse_schema_str(yaml).expect("expression offset should parse");
+        assert!(matches!(
+            schema.fields[1].offset,
+            OffsetKind::Expr(IntExpr::Binary {
+                op: IntExprOp::Add,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn parse_schema_rejects_dynamic_length_on_repeated_field() {
         let yaml = r#"
 schema_name: "DynamicRepeated"
@@ -546,6 +653,32 @@ fields:
       value: 0
     length:
       field: "block_len"
+    repeat:
+      count: 2
+"#;
+
+        expect_validation_error(yaml);
+    }
+
+    #[test]
+    fn parse_schema_rejects_expression_length_on_repeated_field() {
+        let yaml = r#"
+schema_name: "DynamicRepeated"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 0
+    length:
+      expr:
+        op: sub
+        left:
+          field: "block_len"
+        right:
+          const: 1
     repeat:
       count: 2
 "#;
@@ -592,7 +725,32 @@ fields:
     }
 
     #[test]
-    fn parse_schema_rejects_expression_offset() {
+    fn parse_schema_rejects_expression_offset_on_repeated_field() {
+        let yaml = r#"
+schema_name: "DynamicOffsetRepeat"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Expr
+      value:
+        op: add
+        left:
+          field: "data_offset"
+        right:
+          const: 4
+    length: 4
+    repeat:
+      count: 2
+"#;
+
+        expect_validation_error(yaml);
+    }
+
+    #[test]
+    fn parse_schema_rejects_string_expression_offset_payload() {
         let yaml = r#"
 schema_name: "ExprOffset"
 schema_version: 1
@@ -605,7 +763,57 @@ fields:
       value: "a+b"
 "#;
 
+        let err = parse_schema_str(yaml).unwrap_err();
+        assert!(matches!(err, SchemaError::Yaml(_)));
+    }
+
+    #[test]
+    fn parse_schema_rejects_expression_with_empty_field_ref() {
+        let yaml = r#"
+schema_name: "ExprOffset"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 0
+    length:
+      expr:
+        op: add
+        left:
+          field: ""
+        right:
+          const: 4
+"#;
+
         expect_validation_error(yaml);
+    }
+
+    #[test]
+    fn parse_schema_rejects_expression_with_unsupported_op() {
+        let yaml = r#"
+schema_name: "ExprOffset"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 0
+    length:
+      expr:
+        op: mul
+        left:
+          const: 2
+        right:
+          const: 4
+"#;
+
+        let err = parse_schema_str(yaml).unwrap_err();
+        assert!(matches!(err, SchemaError::Yaml(_)));
     }
 
     #[test]
@@ -966,7 +1174,7 @@ fields:
     }
 
     #[test]
-    fn parse_schema_file_rejects_expression_offsets_in_included_fields() {
+    fn parse_schema_file_rejects_string_expression_offsets_in_included_fields() {
         let dir = temp_test_dir("include_expr_offset");
         write_file(
             dir.join("root.yaml"),
@@ -994,8 +1202,7 @@ fields:
         );
 
         let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
-        assert!(matches!(err, SchemaError::Validation(_)));
-        assert!(err.to_string().contains("expression offset"));
+        assert!(matches!(err, SchemaError::Yaml(_)));
 
         cleanup_test_dir(dir);
     }
@@ -1042,11 +1249,33 @@ fields:
         ]
     }
 
+    fn arb_int_expr() -> impl Strategy<Value = IntExpr> {
+        let leaf = prop_oneof![
+            any::<i64>().prop_map(|value| IntExpr::Const { value }),
+            any::<String>().prop_map(|field| IntExpr::FieldRef { field }),
+        ];
+
+        leaf.prop_recursive(4, 16, 2, |inner| {
+            prop_oneof![
+                (inner.clone(), inner.clone()).prop_map(|(left, right)| IntExpr::Binary {
+                    op: IntExprOp::Add,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }),
+                (inner.clone(), inner).prop_map(|(left, right)| IntExpr::Binary {
+                    op: IntExprOp::Sub,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }),
+            ]
+        })
+    }
+
     fn arb_offset_kind() -> impl Strategy<Value = OffsetKind> {
         prop_oneof![
             any::<u64>().prop_map(OffsetKind::Absolute),
             any::<String>().prop_map(OffsetKind::FieldRef),
-            any::<String>().prop_map(OffsetKind::Expr),
+            arb_int_expr().prop_map(OffsetKind::Expr),
         ]
     }
 
@@ -1054,6 +1283,7 @@ fields:
         prop_oneof![
             any::<u64>().prop_map(LengthSpec::Literal),
             any::<String>().prop_map(|field| LengthSpec::FieldRef { field }),
+            arb_int_expr().prop_map(|expr| LengthSpec::Expr { expr }),
         ]
     }
 
