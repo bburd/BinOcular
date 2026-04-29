@@ -11,7 +11,7 @@ It provides a structured, declarative way to explore unknown binary formats, vis
 
 This workspace includes both a CLI and a GUI, with a long-term goal of becoming a robust open-source binary inspection suite.
 
-## Features
+## Features 
 
 - **Portable** - Windows-first, with Linux/macOS support planned  
 - **Fast & Safe** - Rust's safety guarantees without sacrificing performance  
