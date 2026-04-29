@@ -9,6 +9,7 @@ use eframe::egui;
 const HEX_PAGE_SIZE: usize = 1024;
 const HEX_VIEW_HEIGHT: f32 = 300.0;
 const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DISPLAY_BYTES: usize = 256;
 
 struct Document {
     _path: PathBuf,
@@ -264,18 +265,56 @@ fn format_resolved_offset(offset: u64) -> String {
     format!("0x{offset:X} ({offset})")
 }
 
-fn format_value(value: &FieldValue) -> String {
+fn format_value(value: &FieldValue, byte_len: usize) -> String {
     match value {
         FieldValue::UInt(v) => format!("{v} (0x{v:X})"),
         FieldValue::Int(v) => format!("{v} (0x{v:X})"),
         FieldValue::Float(v) => format!("{v}"),
-        FieldValue::Bytes(bytes) => bytes
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(" "),
-        FieldValue::Ascii(text) => text.clone(),
+        FieldValue::Bytes(bytes) => format_bytes_preview(bytes, byte_len),
+        FieldValue::Ascii(text) => format_ascii_preview(text, byte_len),
     }
+}
+
+fn format_bytes_preview(bytes: &[u8], byte_len: usize) -> String {
+    let display_len = if byte_len <= MAX_DISPLAY_BYTES {
+        bytes.len()
+    } else {
+        bytes.len().min(MAX_DISPLAY_BYTES)
+    };
+    let mut rendered: Vec<String> = bytes[..display_len]
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+
+    if byte_len > MAX_DISPLAY_BYTES {
+        rendered.push("...".to_string());
+    }
+
+    let rendered = rendered.join(" ");
+    if byte_len > MAX_DISPLAY_BYTES {
+        format!("{rendered} ({byte_len} bytes)")
+    } else {
+        rendered
+    }
+}
+
+fn format_ascii_preview(text: &str, byte_len: usize) -> String {
+    if byte_len <= MAX_DISPLAY_BYTES {
+        return text.to_string();
+    }
+
+    let mut preview = String::new();
+    let mut used_bytes = 0;
+    for ch in text.chars() {
+        let ch_bytes = ch.len_utf8();
+        if used_bytes + ch_bytes > MAX_DISPLAY_BYTES {
+            break;
+        }
+        preview.push(ch);
+        used_bytes += ch_bytes;
+    }
+
+    format!("{preview}... ({byte_len} bytes)")
 }
 
 fn draw_field_table(
@@ -313,7 +352,8 @@ fn draw_field_table(
                 row_clicked |= response.clicked();
 
                 if let Some(value) = &eval.value {
-                    let response = ui.selectable_label(is_selected, format_value(value));
+                    let response =
+                        ui.selectable_label(is_selected, format_value(value, eval.byte_len));
                     row_clicked |= response.clicked();
                 } else {
                     let response = ui.selectable_label(is_selected, "-");

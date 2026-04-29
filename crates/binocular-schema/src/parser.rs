@@ -54,10 +54,26 @@ pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
 
         let field_label = format!("Field `{}`", field.name);
 
-        if let OffsetKind::Expr(expr) = &field.offset {
-            return Err(SchemaError::Validation(format!(
-                "{field_label} uses expression offset `{expr}`, which is not supported in schema v1"
-            )));
+        match &field.offset {
+            OffsetKind::Absolute(_) => {}
+            OffsetKind::FieldRef(referenced) => {
+                if referenced.trim().is_empty() {
+                    return Err(SchemaError::Validation(format!(
+                        "{field_label} references an empty offset field name"
+                    )));
+                }
+
+                if field.repeat.is_some() {
+                    return Err(SchemaError::Validation(format!(
+                        "{field_label} cannot use dynamic offset together with repeat in schema v1"
+                    )));
+                }
+            }
+            OffsetKind::Expr(expr) => {
+                return Err(SchemaError::Validation(format!(
+                    "{field_label} uses expression offset `{expr}`, which is not supported in schema v1"
+                )));
+            }
         }
 
         if let Some(repeat) = &field.repeat {
@@ -490,6 +506,33 @@ fields:
     }
 
     #[test]
+    fn parse_schema_accepts_dynamic_offset() {
+        let yaml = r#"
+schema_name: "DynamicOffset"
+schema_version: 1
+endianness: little
+fields:
+  - name: "data_offset"
+    type: u32
+    offset:
+      kind: Absolute
+      value: 0
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: FieldRef
+      value: "data_offset"
+    length: 4
+"#;
+
+        let schema = parse_schema_str(yaml).expect("dynamic offset should parse");
+        assert!(matches!(
+            schema.fields[1].offset,
+            OffsetKind::FieldRef(ref field) if field == "data_offset"
+        ));
+    }
+
+    #[test]
     fn parse_schema_rejects_dynamic_length_on_repeated_field() {
         let yaml = r#"
 schema_name: "DynamicRepeated"
@@ -503,6 +546,44 @@ fields:
       value: 0
     length:
       field: "block_len"
+    repeat:
+      count: 2
+"#;
+
+        expect_validation_error(yaml);
+    }
+
+    #[test]
+    fn parse_schema_rejects_empty_dynamic_offset_reference() {
+        let yaml = r#"
+schema_name: "DynamicOffset"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: FieldRef
+      value: ""
+    length: 4
+"#;
+
+        expect_validation_error(yaml);
+    }
+
+    #[test]
+    fn parse_schema_rejects_dynamic_offset_on_repeated_field() {
+        let yaml = r#"
+schema_name: "DynamicOffsetRepeat"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: FieldRef
+      value: "data_offset"
+    length: 4
     repeat:
       count: 2
 "#;
@@ -964,6 +1045,7 @@ fields:
     fn arb_offset_kind() -> impl Strategy<Value = OffsetKind> {
         prop_oneof![
             any::<u64>().prop_map(OffsetKind::Absolute),
+            any::<String>().prop_map(OffsetKind::FieldRef),
             any::<String>().prop_map(OffsetKind::Expr),
         ]
     }

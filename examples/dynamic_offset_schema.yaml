@@ -1,0 +1,15 @@
+schema_name: "Dynamic Offset Example"
+schema_version: 1
+endianness: little
+fields:
+  - name: data_offset
+    type: u32
+    offset:
+      kind: Absolute
+      value: 0
+  - name: payload
+    type: ascii
+    offset:
+      kind: FieldRef
+      value: data_offset
+    length: 4

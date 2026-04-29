@@ -44,7 +44,7 @@ pub fn interpret_field<B: FileBuffer + ?Sized>(
 ) -> Result<FieldValue, InterpretError> {
     let context = FieldContext::new();
     let len = resolve_field_byte_len(field, &context)?;
-    let offset = resolve_base_offset(field)?;
+    let offset = resolve_base_offset(field, &context)?;
     interpret_field_at(buffer, field, schema, offset, len)
 }
 
@@ -108,7 +108,7 @@ pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> 
                 field.name.clone()
             };
 
-            let resolved = resolve_repeated_offset(field, index);
+            let resolved = resolve_repeated_offset(field, index, &context);
             let resolved_offset = match resolved {
                 Ok(offset) => offset,
                 Err(err) => {
@@ -185,9 +185,10 @@ fn fixed_field_byte_len(field: &FieldDef) -> Result<usize, InterpretError> {
     }
 }
 
-fn resolve_base_offset(field: &FieldDef) -> Result<u64, InterpretError> {
+fn resolve_base_offset(field: &FieldDef, context: &FieldContext) -> Result<u64, InterpretError> {
     match &field.offset {
         OffsetKind::Absolute(offset) => Ok(*offset),
+        OffsetKind::FieldRef(referenced) => resolve_dynamic_offset(referenced, context),
         OffsetKind::Expr(_) => Err(InterpretError::Unsupported),
     }
 }
@@ -226,11 +227,10 @@ fn resolve_dynamic_length(
         ContextValue::NonNumeric => Err(InterpretError::InvalidLengthReferenceType {
             field: referenced.to_string(),
         }),
-        ContextValue::Numeric(NumericContextValue::Unsigned(value)) => {
-            usize::try_from(value).map_err(|_| InterpretError::LengthOverflow {
+        ContextValue::Numeric(NumericContextValue::Unsigned(value)) => usize::try_from(value)
+            .map_err(|_| InterpretError::LengthOverflow {
                 field: referenced.to_string(),
-            })
-        }
+            }),
         ContextValue::Numeric(NumericContextValue::Signed(value)) => {
             if value < 0 {
                 return Err(InterpretError::NegativeLengthReference {
@@ -245,13 +245,42 @@ fn resolve_dynamic_length(
     }
 }
 
-fn resolve_repeated_offset(field: &FieldDef, index: u64) -> Result<u64, InterpretError> {
-    let base_offset = resolve_base_offset(field)?;
+fn resolve_dynamic_offset(referenced: &str, context: &FieldContext) -> Result<u64, InterpretError> {
+    let Some(value) = context.get(referenced).copied() else {
+        return Err(InterpretError::MissingOffsetReference {
+            field: referenced.to_string(),
+        });
+    };
+
+    match value {
+        ContextValue::NonNumeric => Err(InterpretError::InvalidOffsetReferenceType {
+            field: referenced.to_string(),
+        }),
+        ContextValue::Numeric(NumericContextValue::Unsigned(value)) => Ok(value),
+        ContextValue::Numeric(NumericContextValue::Signed(value)) => {
+            if value < 0 {
+                return Err(InterpretError::NegativeOffsetReference {
+                    field: referenced.to_string(),
+                });
+            }
+
+            Ok(value as u64)
+        }
+    }
+}
+
+fn resolve_repeated_offset(
+    field: &FieldDef,
+    index: u64,
+    context: &FieldContext,
+) -> Result<u64, InterpretError> {
+    let base_offset = resolve_base_offset(field, context)?;
     if index == 0 {
         return Ok(base_offset);
     }
 
-    let stride = u64::try_from(fixed_field_byte_len(field)?).map_err(|_| InterpretError::OffsetOverflow)?;
+    let stride =
+        u64::try_from(fixed_field_byte_len(field)?).map_err(|_| InterpretError::OffsetOverflow)?;
     let repeated_bytes = index
         .checked_mul(stride)
         .ok_or(InterpretError::OffsetOverflow)?;
@@ -265,7 +294,9 @@ fn record_context_value(context: &mut FieldContext, display_name: &str, value: &
     let context_value = match value {
         FieldValue::UInt(value) => ContextValue::Numeric(NumericContextValue::Unsigned(*value)),
         FieldValue::Int(value) => ContextValue::Numeric(NumericContextValue::Signed(*value)),
-        FieldValue::Float(_) | FieldValue::Bytes(_) | FieldValue::Ascii(_) => ContextValue::NonNumeric,
+        FieldValue::Float(_) | FieldValue::Bytes(_) | FieldValue::Ascii(_) => {
+            ContextValue::NonNumeric
+        }
     };
     context.insert(display_name.to_string(), context_value);
 }
@@ -1003,6 +1034,178 @@ mod tests {
         assert_eq!(
             results[1].error.as_deref(),
             Some("field `label` cannot be used as a dynamic length source")
+        );
+        assert_uint(results[2].value.clone().unwrap(), 0x1234);
+    }
+
+    #[test]
+    fn dynamic_offset_resolves_from_prior_unsigned_field() {
+        let buffer = MemoryBuffer::from_vec(vec![4, 0, 0, 0, b'J', b'U', b'M', b'P']);
+        let schema = Schema {
+            schema_name: "dynamic_offset".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("data_offset", FieldType::U32, 0, None),
+                FieldDef {
+                    name: "payload".to_string(),
+                    ty: FieldType::Ascii,
+                    offset: OffsetKind::FieldRef("data_offset".to_string()),
+                    length: Some(LengthSpec::Literal(4)),
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                },
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results[1].resolved_offset, 4);
+        match results[1].value.as_ref().unwrap() {
+            FieldValue::Ascii(value) => assert_eq!(value, "JUMP"),
+            other => panic!("expected Ascii, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_offset_resolves_from_non_negative_i32_field() {
+        let buffer = MemoryBuffer::from_vec(vec![4, 0, 0, 0, b'D', b'A', b'T', b'A']);
+        let schema = Schema {
+            schema_name: "dynamic_offset_i32".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("data_offset", FieldType::I32, 0, None),
+                FieldDef {
+                    name: "payload".to_string(),
+                    ty: FieldType::Ascii,
+                    offset: OffsetKind::FieldRef("data_offset".to_string()),
+                    length: Some(LengthSpec::Literal(4)),
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                },
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results[1].resolved_offset, 4);
+        match results[1].value.as_ref().unwrap() {
+            FieldValue::Ascii(value) => assert_eq!(value, "DATA"),
+            other => panic!("expected Ascii, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_offset_missing_reference_becomes_row_error() {
+        let buffer = MemoryBuffer::from_vec(vec![b'O', b'K']);
+        let schema = Schema {
+            schema_name: "missing_offset_ref".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![FieldDef {
+                name: "payload".to_string(),
+                ty: FieldType::Ascii,
+                offset: OffsetKind::FieldRef("missing".to_string()),
+                length: Some(LengthSpec::Literal(2)),
+                endianness: None,
+                description: None,
+                repeat: None,
+            }],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert!(results[0].value.is_none());
+        assert_eq!(results[0].byte_len, 0);
+        assert_eq!(results[0].resolved_offset, 0);
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some("missing dynamic offset reference `missing`")
+        );
+    }
+
+    #[test]
+    fn dynamic_offset_rejects_non_numeric_reference_source() {
+        let buffer = MemoryBuffer::from_vec(vec![b'O', b'K', b'A', b'Y']);
+        let schema = Schema {
+            schema_name: "non_numeric_offset_ref".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![
+                make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
+                FieldDef {
+                    name: "payload".to_string(),
+                    ty: FieldType::Ascii,
+                    offset: OffsetKind::FieldRef("label".to_string()),
+                    length: Some(LengthSpec::Literal(2)),
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                },
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `label` cannot be used as a dynamic offset source")
+        );
+    }
+
+    #[test]
+    fn dynamic_offset_rejects_negative_i32_reference() {
+        let buffer = MemoryBuffer::from_vec(vec![255, 255, 255, 255, b'O']);
+        let schema = Schema {
+            schema_name: "negative_offset_ref".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("data_offset", FieldType::I32, 0, None),
+                FieldDef {
+                    name: "payload".to_string(),
+                    ty: FieldType::Ascii,
+                    offset: OffsetKind::FieldRef("data_offset".to_string()),
+                    length: Some(LengthSpec::Literal(1)),
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                },
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `data_offset` resolved to a negative dynamic offset")
+        );
+    }
+
+    #[test]
+    fn dynamic_offset_failure_does_not_block_later_fields() {
+        let buffer = MemoryBuffer::from_vec(vec![b'A', b'B', 0x34, 0x12]);
+        let schema = Schema {
+            schema_name: "continue_after_offset_error".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
+                FieldDef {
+                    name: "payload".to_string(),
+                    ty: FieldType::Bytes,
+                    offset: OffsetKind::FieldRef("label".to_string()),
+                    length: Some(LengthSpec::Literal(1)),
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                },
+                make_field("tail", FieldType::U16, 2, None),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `label` cannot be used as a dynamic offset source")
         );
         assert_uint(results[2].value.clone().unwrap(), 0x1234);
     }

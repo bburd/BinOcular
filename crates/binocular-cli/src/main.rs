@@ -18,13 +18,14 @@ use binocular_schema::parser::parse_schema_file;
 use clap::Parser;
 use serde_json::json;
 
+const MAX_DISPLAY_BYTES: usize = 256;
 const BANNER: &str = include_str!("../assets/ascii/banner.txt");
 const BADGE: &str = include_str!("../assets/ascii/badge.txt");
-const TAGLINE: &str = "BinOcular — Know your bytes. Don’t guess them.";
+const TAGLINE: &str = "BinOcular â€” Know your bytes. Donâ€™t guess them.";
 
 #[derive(Parser)]
 #[command(name = "binocular-cli")]
-#[command(about = "BinOcular — Know your bytes. Don’t guess them.", long_about = None)]
+#[command(about = "BinOcular â€” Know your bytes. Donâ€™t guess them.", long_about = None)]
 struct Cli {
     /// Path to the binary file to inspect.
     #[arg(required_unless_present = "branding")]
@@ -37,6 +38,10 @@ struct Cli {
     /// Output as JSON instead of a human-readable table.
     #[arg(long)]
     json: bool,
+
+    /// Emit full bytes/ascii values instead of capped previews.
+    #[arg(long)]
+    full_bytes: bool,
 
     /// Prepend branding banner and version before human-readable output.
     #[arg(long)]
@@ -101,6 +106,7 @@ fn main() -> anyhow::Result<()> {
             offset: Some(eval.resolved_offset),
             offset_hex: Some(format!("0x{:08X}", eval.resolved_offset)),
             field_type: render_field_type(&eval.field, eval.byte_len),
+            byte_len: eval.byte_len,
             value: eval.value,
             error: eval.error,
         })
@@ -117,7 +123,7 @@ fn main() -> anyhow::Result<()> {
                     "offset": record.offset,
                     "offset_hex": record.offset_hex,
                     "type": record.field_type,
-                    "value": render_json_value(record.value),
+                    "value": render_json_value(record.value, record.byte_len, cli.full_bytes),
                     "error": record.error,
                 })
             })
@@ -128,25 +134,25 @@ fn main() -> anyhow::Result<()> {
         // Early return to avoid executing the branding branch below when
         // `--json` is set. Branding is meant for human-readable output only.
         return Ok(());
-    } else {
-        print_badge();
+    }
 
-        if cli.branding {
-            print_banner();
-            println!("v{}", env!("CARGO_PKG_VERSION"));
-        }
+    print_badge();
 
-        println!("NAME|OFFSET|TYPE|VALUE|ERROR");
-        for record in records {
-            let offset = render_offset(record.offset);
-            let value = render_table_value(record.value.as_ref());
-            let error = record.error.unwrap_or_else(|| "-".to_string());
+    if cli.branding {
+        print_banner();
+        println!("v{}", env!("CARGO_PKG_VERSION"));
+    }
 
-            println!(
-                "{}|{}|{}|{}|{}",
-                record.name, offset, record.field_type, value, error
-            );
-        }
+    println!("NAME|OFFSET|TYPE|VALUE|ERROR");
+    for record in records {
+        let offset = render_offset(record.offset);
+        let value = render_table_value(record.value.as_ref(), record.byte_len, cli.full_bytes);
+        let error = record.error.unwrap_or_else(|| "-".to_string());
+
+        println!(
+            "{}|{}|{}|{}|{}",
+            record.name, offset, record.field_type, value, error
+        );
     }
 
     Ok(())
@@ -158,6 +164,7 @@ struct FieldRecord {
     offset: Option<u64>,
     offset_hex: Option<String>,
     field_type: String,
+    byte_len: usize,
     value: Option<FieldValue>,
     error: Option<String>,
 }
@@ -182,66 +189,97 @@ fn render_field_type(field: &FieldDef, byte_len: usize) -> String {
     }
 }
 
-fn render_table_value(value: Option<&FieldValue>) -> String {
+fn render_table_value(value: Option<&FieldValue>, byte_len: usize, full_bytes: bool) -> String {
     value
-        .map(render_field_value)
+        .map(|value| render_field_value(value, byte_len, full_bytes, true))
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn render_field_value(value: &FieldValue) -> String {
+fn render_field_value(
+    value: &FieldValue,
+    byte_len: usize,
+    full_bytes: bool,
+    quote_ascii: bool,
+) -> String {
     match value {
         FieldValue::UInt(v) => format!("{} (0x{:X})", v, v),
         FieldValue::Int(v) => format!("{} (0x{:X})", v, v),
-        FieldValue::Float(v) => format!("{}", v),
-        FieldValue::Bytes(bytes) => render_bytes(bytes),
-        FieldValue::Ascii(text) => render_ascii(text),
+        FieldValue::Float(v) => format!("{v}"),
+        FieldValue::Bytes(bytes) => render_bytes(bytes, byte_len, full_bytes),
+        FieldValue::Ascii(text) => render_ascii(text, byte_len, full_bytes, quote_ascii),
     }
 }
 
-fn render_json_value(value: Option<FieldValue>) -> serde_json::Value {
+fn render_json_value(
+    value: Option<FieldValue>,
+    byte_len: usize,
+    full_bytes: bool,
+) -> serde_json::Value {
     match value {
         Some(FieldValue::UInt(v)) => json!(v),
         Some(FieldValue::Int(v)) => json!(v),
         Some(FieldValue::Float(v)) => json!(v),
-        Some(FieldValue::Bytes(bytes)) => json!(render_bytes(&bytes)), // fine to keep as hex string
-        Some(FieldValue::Ascii(text)) => json!(text),                  // 👈 use raw text
+        Some(value @ FieldValue::Bytes(_)) | Some(value @ FieldValue::Ascii(_)) => {
+            json!(render_field_value(&value, byte_len, full_bytes, false))
+        }
         None => serde_json::Value::Null,
     }
 }
 
-fn render_bytes(bytes: &[u8]) -> String {
-    const MAX_BYTES: usize = 16;
-
-    let display_len = bytes.len().min(MAX_BYTES);
+fn render_bytes(bytes: &[u8], byte_len: usize, full_bytes: bool) -> String {
+    let display_len = if full_bytes || byte_len <= MAX_DISPLAY_BYTES {
+        bytes.len()
+    } else {
+        bytes.len().min(MAX_DISPLAY_BYTES)
+    };
     let mut rendered: Vec<String> = bytes[..display_len]
         .iter()
         .map(|b| format!("{b:02X}"))
         .collect();
 
-    if bytes.len() > MAX_BYTES {
-        rendered.push("…".to_string());
+    if !full_bytes && byte_len > MAX_DISPLAY_BYTES {
+        rendered.push("...".to_string());
     }
 
     let rendered = rendered.join(" ");
 
-    if bytes.len() > MAX_BYTES {
-        format!("{rendered} (len={})", bytes.len())
+    if !full_bytes && byte_len > MAX_DISPLAY_BYTES {
+        format!("{rendered} ({byte_len} bytes)")
     } else {
         rendered
     }
 }
 
-fn render_ascii(text: &str) -> String {
-    const MAX_CHARS: usize = 32;
-    let mut escaped = text
-        .chars()
-        .take(MAX_CHARS)
-        .flat_map(|c| c.escape_default())
-        .collect::<String>();
+fn render_ascii(text: &str, byte_len: usize, full_bytes: bool, quote_ascii: bool) -> String {
+    let rendered = if full_bytes || byte_len <= MAX_DISPLAY_BYTES {
+        render_ascii_preview(text, usize::MAX)
+    } else {
+        format!("{}... ({byte_len} bytes)", render_ascii_preview(text, MAX_DISPLAY_BYTES))
+    };
 
-    if text.chars().count() > MAX_CHARS {
-        escaped.push('…');
+    maybe_quote(rendered, quote_ascii)
+}
+
+fn render_ascii_preview(text: &str, max_bytes: usize) -> String {
+    let mut escaped = String::new();
+    let mut used_bytes = 0;
+
+    for ch in text.chars() {
+        let ch_bytes = ch.len_utf8();
+        if used_bytes + ch_bytes > max_bytes {
+            break;
+        }
+        escaped.extend(ch.escape_default());
+        used_bytes += ch_bytes;
     }
 
-    format!("\"{}\"", escaped)
+    escaped
+}
+
+fn maybe_quote(rendered: String, quote_ascii: bool) -> String {
+    if quote_ascii {
+        format!("\"{rendered}\"")
+    } else {
+        rendered
+    }
 }

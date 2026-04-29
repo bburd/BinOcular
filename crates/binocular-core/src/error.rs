@@ -17,6 +17,15 @@ pub enum InterpretError {
     #[error("invalid numeric byte width: expected {expected}, got {actual}")]
     InvalidNumericByteWidth { expected: usize, actual: usize },
 
+    #[error("missing dynamic offset reference `{field}`")]
+    MissingOffsetReference { field: String },
+
+    #[error("field `{field}` cannot be used as a dynamic offset source")]
+    InvalidOffsetReferenceType { field: String },
+
+    #[error("field `{field}` resolved to a negative dynamic offset")]
+    NegativeOffsetReference { field: String },
+
     #[error("missing dynamic length reference `{field}`")]
     MissingLengthReference { field: String },
 

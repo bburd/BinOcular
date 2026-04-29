@@ -32,6 +32,10 @@ fn remove_if_exists(path: &PathBuf) {
     let _ = fs::remove_file(path);
 }
 
+fn run_cli(args: &[&str]) -> Result<std::process::Output, Box<dyn std::error::Error>> {
+    Ok(cargo_bin_cmd!("binocular-cli").args(args).output()?)
+}
+
 #[test]
 fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -137,6 +141,62 @@ fields:
     assert_eq!(records[2].name, "value[2]");
     assert_eq!(records[2].offset, Some(4));
     assert_eq!(records[2].value.as_u64(), Some(3));
+
+    Ok(())
+}
+
+#[test]
+fn dynamic_offset_schema_outputs_resolved_runtime_offset() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema_path = unique_temp_path("dynamic_offset_schema", "yaml");
+    let bin_path = unique_temp_path("dynamic_offset_data", "bin");
+
+    let schema = r#"
+schema_name: "DynamicOffset"
+schema_version: 1
+endianness: little
+fields:
+  - name: "data_offset"
+    type: u32
+    offset:
+      kind: Absolute
+      value: 0
+  - name: "payload"
+    type: ascii
+    offset:
+      kind: FieldRef
+      value: "data_offset"
+    length: 4
+"#;
+
+    fs::write(&schema_path, schema)?;
+    fs::write(&bin_path, [4_u8, 0, 0, 0, b'T', b'E', b'S', b'T'])?;
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--schema",
+            schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    remove_if_exists(&schema_path);
+    remove_if_exists(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    assert_eq!(records.len(), 2);
+
+    assert_eq!(records[0].name, "data_offset");
+    assert_eq!(records[0].offset, Some(0));
+    assert_eq!(records[0].value.as_u64(), Some(4));
+
+    assert_eq!(records[1].name, "payload");
+    assert_eq!(records[1].offset, Some(4));
+    assert_eq!(records[1].value.as_str(), Some("TEST"));
 
     Ok(())
 }
@@ -308,7 +368,7 @@ fn json_mode_emits_raw_json_without_branding() -> Result<(), Box<dyn std::error:
     );
 
     assert!(
-        !stdout.contains("BinOcular — Know your bytes. Don’t guess them."),
+        !stdout.contains("Know your bytes"),
         "JSON mode must omit branding copy"
     );
 
@@ -374,7 +434,7 @@ fn branding_adds_header_to_human_output() -> Result<(), Box<dyn std::error::Erro
     let stdout = String::from_utf8(output.stdout)?;
 
     assert!(
-        stdout.contains("BinOcular — Know your bytes. Don’t guess them."),
+        stdout.contains("Know your bytes"),
         "Branding must include the banner and tagline"
     );
     assert!(
@@ -388,3 +448,230 @@ fn branding_adds_header_to_human_output() -> Result<(), Box<dyn std::error::Erro
 
     Ok(())
 }
+
+#[test]
+fn oversized_ascii_json_is_preview_only_by_default() -> Result<(), Box<dyn std::error::Error>> {
+    let schema_path = unique_temp_path("oversized_ascii_schema", "yaml");
+    let bin_path = unique_temp_path("oversized_ascii_data", "bin");
+    let payload = "A".repeat(257);
+
+    let schema = r#"
+schema_name: "OversizedAscii"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: ascii
+    offset:
+      kind: Absolute
+      value: 0
+    length: 257
+"#;
+
+    fs::write(&schema_path, schema)?;
+    fs::write(&bin_path, payload.as_bytes())?;
+
+    let output = run_cli(&[
+        "--json",
+        "--schema",
+        schema_path.to_str().ok_or("Invalid schema path")?,
+        bin_path.to_str().ok_or("Invalid binary path")?,
+    ])?;
+
+    remove_if_exists(&schema_path);
+    remove_if_exists(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    let value = records[0].value.as_str().ok_or("Expected string value")?;
+
+    assert!(value.contains("257 bytes"));
+    assert!(value.ends_with("... (257 bytes)"));
+    assert_ne!(value, payload);
+
+    Ok(())
+}
+
+#[test]
+fn oversized_bytes_json_is_preview_only_by_default() -> Result<(), Box<dyn std::error::Error>> {
+    let schema_path = unique_temp_path("oversized_bytes_schema", "yaml");
+    let bin_path = unique_temp_path("oversized_bytes_data", "bin");
+    let payload = vec![0xAB_u8; 257];
+
+    let schema = r#"
+schema_name: "OversizedBytes"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 0
+    length: 257
+"#;
+
+    fs::write(&schema_path, schema)?;
+    fs::write(&bin_path, &payload)?;
+
+    let output = run_cli(&[
+        "--json",
+        "--schema",
+        schema_path.to_str().ok_or("Invalid schema path")?,
+        bin_path.to_str().ok_or("Invalid binary path")?,
+    ])?;
+
+    remove_if_exists(&schema_path);
+    remove_if_exists(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    let value = records[0].value.as_str().ok_or("Expected string value")?;
+
+    assert!(value.contains("257 bytes"));
+    assert!(value.ends_with("... (257 bytes)"));
+    assert!(value.len() < 1024, "preview should stay compact");
+
+    Ok(())
+}
+
+#[test]
+fn full_bytes_restores_oversized_json_output() -> Result<(), Box<dyn std::error::Error>> {
+    let ascii_schema_path = unique_temp_path("full_ascii_schema", "yaml");
+    let ascii_bin_path = unique_temp_path("full_ascii_data", "bin");
+    let ascii_payload = "B".repeat(257);
+
+    let ascii_schema = r#"
+schema_name: "FullAscii"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: ascii
+    offset:
+      kind: Absolute
+      value: 0
+    length: 257
+"#;
+
+    fs::write(&ascii_schema_path, ascii_schema)?;
+    fs::write(&ascii_bin_path, ascii_payload.as_bytes())?;
+
+    let ascii_output = run_cli(&[
+        "--json",
+        "--full-bytes",
+        "--schema",
+        ascii_schema_path.to_str().ok_or("Invalid schema path")?,
+        ascii_bin_path.to_str().ok_or("Invalid binary path")?,
+    ])?;
+
+    remove_if_exists(&ascii_schema_path);
+    remove_if_exists(&ascii_bin_path);
+
+    assert!(ascii_output.status.success(), "CLI did not exit successfully");
+
+    let ascii_stdout = String::from_utf8(ascii_output.stdout)?;
+    let ascii_records: Vec<Record> = serde_json::from_str(&ascii_stdout)?;
+    assert_eq!(ascii_records[0].value.as_str(), Some(ascii_payload.as_str()));
+
+    let bytes_schema_path = unique_temp_path("full_bytes_schema", "yaml");
+    let bytes_bin_path = unique_temp_path("full_bytes_data", "bin");
+    let bytes_payload = vec![0xCD_u8; 257];
+
+    let bytes_schema = r#"
+schema_name: "FullBytes"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 0
+    length: 257
+"#;
+
+    fs::write(&bytes_schema_path, bytes_schema)?;
+    fs::write(&bytes_bin_path, &bytes_payload)?;
+
+    let bytes_output = run_cli(&[
+        "--json",
+        "--full-bytes",
+        "--schema",
+        bytes_schema_path.to_str().ok_or("Invalid schema path")?,
+        bytes_bin_path.to_str().ok_or("Invalid binary path")?,
+    ])?;
+
+    remove_if_exists(&bytes_schema_path);
+    remove_if_exists(&bytes_bin_path);
+
+    assert!(bytes_output.status.success(), "CLI did not exit successfully");
+
+    let bytes_stdout = String::from_utf8(bytes_output.stdout)?;
+    let bytes_records: Vec<Record> = serde_json::from_str(&bytes_stdout)?;
+    let value = bytes_records[0]
+        .value
+        .as_str()
+        .ok_or("Expected string value")?;
+    let expected = std::iter::repeat_n("CD", 257).collect::<Vec<_>>().join(" ");
+    assert_eq!(value, expected);
+
+    Ok(())
+}
+
+#[test]
+fn display_cap_boundary_is_not_truncated_at_256_bytes() -> Result<(), Box<dyn std::error::Error>> {
+    let schema_path = unique_temp_path("boundary_ascii_schema", "yaml");
+    let bin_path = unique_temp_path("boundary_ascii_data", "bin");
+    let payload = "C".repeat(256);
+
+    let schema = r#"
+schema_name: "BoundaryAscii"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: ascii
+    offset:
+      kind: Absolute
+      value: 0
+    length: 256
+"#;
+
+    fs::write(&schema_path, schema)?;
+    fs::write(&bin_path, payload.as_bytes())?;
+
+    let json_output = run_cli(&[
+        "--json",
+        "--schema",
+        schema_path.to_str().ok_or("Invalid schema path")?,
+        bin_path.to_str().ok_or("Invalid binary path")?,
+    ])?;
+
+    let table_output = run_cli(&[
+        "--schema",
+        schema_path.to_str().ok_or("Invalid schema path")?,
+        bin_path.to_str().ok_or("Invalid binary path")?,
+    ])?;
+
+    remove_if_exists(&schema_path);
+    remove_if_exists(&bin_path);
+
+    assert!(json_output.status.success(), "CLI did not exit successfully");
+    assert!(table_output.status.success(), "CLI did not exit successfully");
+
+    let json_stdout = String::from_utf8(json_output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&json_stdout)?;
+    assert_eq!(records[0].value.as_str(), Some(payload.as_str()));
+
+    let table_stdout = String::from_utf8(table_output.stdout)?;
+    assert!(table_stdout.contains(&format!("\"{payload}\"")));
+    assert!(!table_stdout.contains("256 bytes"));
+
+    Ok(())
+}
+

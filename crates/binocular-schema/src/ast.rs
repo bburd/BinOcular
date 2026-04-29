@@ -19,6 +19,7 @@ pub enum Endianness {
 #[serde(tag = "kind", content = "value")]
 pub enum OffsetKind {
     Absolute(u64),
+    FieldRef(String),
     Expr(String),
 }
 
