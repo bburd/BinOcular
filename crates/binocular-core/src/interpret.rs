@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use crate::buffer::FileBuffer;
 use crate::error::InterpretError;
-use binocular_schema::ast::{Endianness, FieldDef, FieldType, OffsetKind, Schema};
+use binocular_schema::ast::{Endianness, FieldDef, FieldType, LengthSpec, OffsetKind, Schema};
 
 #[derive(Debug, Clone)]
 pub enum FieldValue {
@@ -21,12 +23,27 @@ pub struct FieldEval {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NumericContextValue {
+    Unsigned(u64),
+    Signed(i64),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ContextValue {
+    Numeric(NumericContextValue),
+    NonNumeric,
+}
+
+type FieldContext = HashMap<String, ContextValue>;
+
 pub fn interpret_field<B: FileBuffer + ?Sized>(
     buffer: &B,
     field: &FieldDef,
     schema: Option<&Schema>,
 ) -> Result<FieldValue, InterpretError> {
-    let len = field_byte_len(field);
+    let context = FieldContext::new();
+    let len = resolve_field_byte_len(field, &context)?;
     let offset = resolve_base_offset(field)?;
     interpret_field_at(buffer, field, schema, offset, len)
 }
@@ -79,9 +96,9 @@ fn interpret_field_at<B: FileBuffer + ?Sized>(
 
 pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> Vec<FieldEval> {
     let mut rows = Vec::new();
+    let mut context = FieldContext::new();
 
     for field in &schema.fields {
-        let byte_len = field_byte_len(field);
         let count = field.repeat.as_ref().map_or(1, |repeat| repeat.count);
 
         for index in 0..count {
@@ -91,7 +108,7 @@ pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> 
                 field.name.clone()
             };
 
-            let resolved = resolve_repeated_offset(field, index, byte_len);
+            let resolved = resolve_repeated_offset(field, index);
             let resolved_offset = match resolved {
                 Ok(offset) => offset,
                 Err(err) => {
@@ -99,7 +116,22 @@ pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> 
                         field: field.clone(),
                         display_name,
                         resolved_offset: 0,
-                        byte_len,
+                        byte_len: 0,
+                        value: None,
+                        error: Some(err.to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            let byte_len = match resolve_field_byte_len(field, &context) {
+                Ok(byte_len) => byte_len,
+                Err(err) => {
+                    rows.push(FieldEval {
+                        field: field.clone(),
+                        display_name,
+                        resolved_offset,
+                        byte_len: 0,
                         value: None,
                         error: Some(err.to_string()),
                     });
@@ -109,14 +141,17 @@ pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> 
 
             let value = interpret_field_at(buffer, field, Some(schema), resolved_offset, byte_len);
             match value {
-                Ok(value) => rows.push(FieldEval {
-                    field: field.clone(),
-                    display_name,
-                    resolved_offset,
-                    byte_len,
-                    value: Some(value),
-                    error: None,
-                }),
+                Ok(value) => {
+                    record_context_value(&mut context, &display_name, &value);
+                    rows.push(FieldEval {
+                        field: field.clone(),
+                        display_name,
+                        resolved_offset,
+                        byte_len,
+                        value: Some(value),
+                        error: None,
+                    })
+                }
                 Err(err) => rows.push(FieldEval {
                     field: field.clone(),
                     display_name,
@@ -132,13 +167,21 @@ pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> 
     rows
 }
 
-fn field_byte_len(field: &FieldDef) -> usize {
+fn fixed_field_byte_len(field: &FieldDef) -> Result<usize, InterpretError> {
     match field.ty {
-        FieldType::U8 => 1,
-        FieldType::U16 => 2,
-        FieldType::U32 | FieldType::I32 | FieldType::F32 => 4,
-        FieldType::U64 => 8,
-        FieldType::Bytes | FieldType::Ascii => field.length.unwrap_or(0) as usize,
+        FieldType::U8 => Ok(1),
+        FieldType::U16 => Ok(2),
+        FieldType::U32 | FieldType::I32 | FieldType::F32 => Ok(4),
+        FieldType::U64 => Ok(8),
+        FieldType::Bytes | FieldType::Ascii => match &field.length {
+            Some(LengthSpec::Literal(length)) => {
+                usize::try_from(*length).map_err(|_| InterpretError::LengthOverflow {
+                    field: field.name.clone(),
+                })
+            }
+            Some(LengthSpec::FieldRef { .. }) => Err(InterpretError::Unsupported),
+            None => Ok(0),
+        },
     }
 }
 
@@ -149,13 +192,66 @@ fn resolve_base_offset(field: &FieldDef) -> Result<u64, InterpretError> {
     }
 }
 
-fn resolve_repeated_offset(
+fn resolve_field_byte_len(
     field: &FieldDef,
-    index: u64,
-    byte_len: usize,
-) -> Result<u64, InterpretError> {
+    context: &FieldContext,
+) -> Result<usize, InterpretError> {
+    match field.ty {
+        FieldType::Bytes | FieldType::Ascii => match &field.length {
+            Some(LengthSpec::Literal(length)) => {
+                usize::try_from(*length).map_err(|_| InterpretError::LengthOverflow {
+                    field: field.name.clone(),
+                })
+            }
+            Some(LengthSpec::FieldRef { field: referenced }) => {
+                resolve_dynamic_length(referenced, context)
+            }
+            None => Ok(0),
+        },
+        _ => fixed_field_byte_len(field),
+    }
+}
+
+fn resolve_dynamic_length(
+    referenced: &str,
+    context: &FieldContext,
+) -> Result<usize, InterpretError> {
+    let Some(value) = context.get(referenced).copied() else {
+        return Err(InterpretError::MissingLengthReference {
+            field: referenced.to_string(),
+        });
+    };
+
+    match value {
+        ContextValue::NonNumeric => Err(InterpretError::InvalidLengthReferenceType {
+            field: referenced.to_string(),
+        }),
+        ContextValue::Numeric(NumericContextValue::Unsigned(value)) => {
+            usize::try_from(value).map_err(|_| InterpretError::LengthOverflow {
+                field: referenced.to_string(),
+            })
+        }
+        ContextValue::Numeric(NumericContextValue::Signed(value)) => {
+            if value < 0 {
+                return Err(InterpretError::NegativeLengthReference {
+                    field: referenced.to_string(),
+                });
+            }
+
+            usize::try_from(value as u64).map_err(|_| InterpretError::LengthOverflow {
+                field: referenced.to_string(),
+            })
+        }
+    }
+}
+
+fn resolve_repeated_offset(field: &FieldDef, index: u64) -> Result<u64, InterpretError> {
     let base_offset = resolve_base_offset(field)?;
-    let stride = u64::try_from(byte_len).map_err(|_| InterpretError::OffsetOverflow)?;
+    if index == 0 {
+        return Ok(base_offset);
+    }
+
+    let stride = u64::try_from(fixed_field_byte_len(field)?).map_err(|_| InterpretError::OffsetOverflow)?;
     let repeated_bytes = index
         .checked_mul(stride)
         .ok_or(InterpretError::OffsetOverflow)?;
@@ -163,6 +259,15 @@ fn resolve_repeated_offset(
     base_offset
         .checked_add(repeated_bytes)
         .ok_or(InterpretError::OffsetOverflow)
+}
+
+fn record_context_value(context: &mut FieldContext, display_name: &str, value: &FieldValue) {
+    let context_value = match value {
+        FieldValue::UInt(value) => ContextValue::Numeric(NumericContextValue::Unsigned(*value)),
+        FieldValue::Int(value) => ContextValue::Numeric(NumericContextValue::Signed(*value)),
+        FieldValue::Float(_) | FieldValue::Bytes(_) | FieldValue::Ascii(_) => ContextValue::NonNumeric,
+    };
+    context.insert(display_name.to_string(), context_value);
 }
 
 fn read_u16(bytes: &[u8], endianness: Endianness) -> Result<u16, InterpretError> {
@@ -239,7 +344,7 @@ fn read_f32(bytes: &[u8], endianness: Endianness) -> Result<f32, InterpretError>
 mod tests {
     use super::*;
     use crate::buffer::MemoryBuffer;
-    use binocular_schema::ast::{Endianness, FieldDef, FieldType, OffsetKind, Schema};
+    use binocular_schema::ast::{Endianness, FieldDef, FieldType, LengthSpec, OffsetKind, Schema};
 
     fn make_field(
         name: &str,
@@ -253,6 +358,18 @@ mod tests {
             offset: OffsetKind::Absolute(offset),
             length: None,
             endianness,
+            description: None,
+            repeat: None,
+        }
+    }
+
+    fn make_sized_field(name: &str, ty: FieldType, offset: u64, length: LengthSpec) -> FieldDef {
+        FieldDef {
+            name: name.to_string(),
+            ty,
+            offset: OffsetKind::Absolute(offset),
+            length: Some(length),
+            endianness: None,
             description: None,
             repeat: None,
         }
@@ -559,7 +676,7 @@ mod tests {
                 name: "chunk".to_string(),
                 ty: FieldType::Ascii,
                 offset: OffsetKind::Absolute(0),
-                length: Some(4),
+                length: Some(LengthSpec::Literal(4)),
                 endianness: None,
                 description: None,
                 repeat: Some(binocular_schema::ast::RepeatInfo { count: 2 }),
@@ -659,5 +776,234 @@ mod tests {
             results[1].error.as_deref(),
             Some("resolved offset overflowed during repeat expansion")
         );
+    }
+
+    #[test]
+    fn dynamic_length_resolves_from_prior_unsigned_field() {
+        let buffer = MemoryBuffer::from_vec(vec![3, 0, b'C', b'A', b'T']);
+        let schema = Schema {
+            schema_name: "dynamic".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("block_len", FieldType::U16, 0, None),
+                make_sized_field(
+                    "payload",
+                    FieldType::Ascii,
+                    2,
+                    LengthSpec::FieldRef {
+                        field: "block_len".to_string(),
+                    },
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].byte_len, 3);
+        match results[1].value.as_ref().unwrap() {
+            FieldValue::Ascii(value) => assert_eq!(value, "CAT"),
+            other => panic!("expected Ascii, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_length_resolves_from_non_negative_i32_field() {
+        let buffer = MemoryBuffer::from_vec(vec![4, 0, 0, 0, b'T', b'E', b'S', b'T']);
+        let schema = Schema {
+            schema_name: "dynamic_i32".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("block_len", FieldType::I32, 0, None),
+                make_sized_field(
+                    "payload",
+                    FieldType::Ascii,
+                    4,
+                    LengthSpec::FieldRef {
+                        field: "block_len".to_string(),
+                    },
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results[1].byte_len, 4);
+        match results[1].value.as_ref().unwrap() {
+            FieldValue::Ascii(value) => assert_eq!(value, "TEST"),
+            other => panic!("expected Ascii, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_length_can_reference_repeated_numeric_display_name() {
+        let buffer = MemoryBuffer::from_vec(vec![2, 0, 3, 0, b'H', b'E', b'Y']);
+        let schema = Schema {
+            schema_name: "dynamic_repeat_source".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                FieldDef {
+                    name: "sizes".to_string(),
+                    ty: FieldType::U16,
+                    offset: OffsetKind::Absolute(0),
+                    length: None,
+                    endianness: None,
+                    description: None,
+                    repeat: Some(binocular_schema::ast::RepeatInfo { count: 2 }),
+                },
+                make_sized_field(
+                    "payload",
+                    FieldType::Ascii,
+                    4,
+                    LengthSpec::FieldRef {
+                        field: "sizes[1]".to_string(),
+                    },
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(results[2].byte_len, 3);
+        match results[2].value.as_ref().unwrap() {
+            FieldValue::Ascii(value) => assert_eq!(value, "HEY"),
+            other => panic!("expected Ascii, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_length_missing_reference_becomes_row_error() {
+        let buffer = MemoryBuffer::from_vec(vec![b'O', b'K']);
+        let schema = Schema {
+            schema_name: "missing_ref".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![make_sized_field(
+                "payload",
+                FieldType::Ascii,
+                0,
+                LengthSpec::FieldRef {
+                    field: "missing".to_string(),
+                },
+            )],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert!(results[0].value.is_none());
+        assert_eq!(results[0].byte_len, 0);
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some("missing dynamic length reference `missing`")
+        );
+    }
+
+    #[test]
+    fn dynamic_length_rejects_non_numeric_reference_source() {
+        let buffer = MemoryBuffer::from_vec(vec![b'O', b'K', b'A', b'Y']);
+        let schema = Schema {
+            schema_name: "non_numeric_ref".to_string(),
+            schema_version: 1,
+            endianness: None,
+            fields: vec![
+                make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
+                make_sized_field(
+                    "payload",
+                    FieldType::Ascii,
+                    2,
+                    LengthSpec::FieldRef {
+                        field: "label".to_string(),
+                    },
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `label` cannot be used as a dynamic length source")
+        );
+    }
+
+    #[test]
+    fn dynamic_length_rejects_float_reference_source() {
+        let buffer = MemoryBuffer::from_vec(vec![0, 0, 128, 63, b'O']);
+        let schema = Schema {
+            schema_name: "float_ref".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("len", FieldType::F32, 0, None),
+                make_sized_field(
+                    "payload",
+                    FieldType::Ascii,
+                    4,
+                    LengthSpec::FieldRef {
+                        field: "len".to_string(),
+                    },
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `len` cannot be used as a dynamic length source")
+        );
+    }
+
+    #[test]
+    fn dynamic_length_rejects_negative_i32_reference() {
+        let buffer = MemoryBuffer::from_vec(vec![255, 255, 255, 255, b'O']);
+        let schema = Schema {
+            schema_name: "negative_ref".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_field("len", FieldType::I32, 0, None),
+                make_sized_field(
+                    "payload",
+                    FieldType::Ascii,
+                    4,
+                    LengthSpec::FieldRef {
+                        field: "len".to_string(),
+                    },
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `len` resolved to a negative dynamic length")
+        );
+    }
+
+    #[test]
+    fn dynamic_length_failure_does_not_block_later_fields() {
+        let buffer = MemoryBuffer::from_vec(vec![b'A', b'B', 0x34, 0x12]);
+        let schema = Schema {
+            schema_name: "continue_after_error".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            fields: vec![
+                make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
+                make_sized_field(
+                    "payload",
+                    FieldType::Bytes,
+                    0,
+                    LengthSpec::FieldRef {
+                        field: "label".to_string(),
+                    },
+                ),
+                make_field("tail", FieldType::U16, 2, None),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `label` cannot be used as a dynamic length source")
+        );
+        assert_uint(results[2].value.clone().unwrap(), 0x1234);
     }
 }

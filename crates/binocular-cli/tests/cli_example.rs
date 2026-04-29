@@ -9,7 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct Record {
     name: String,
     offset: Option<u64>,
+    #[serde(rename = "type")]
+    field_type: Option<String>,
     value: Value,
+    error: Option<String>,
 }
 
 fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
@@ -227,6 +230,49 @@ fields:
     assert_eq!(records[3].name, "tail");
     assert_eq!(records[3].offset, Some(6));
     assert_eq!(records[3].value.as_str(), Some("DE F0"));
+
+    Ok(())
+}
+
+#[test]
+fn dynamic_length_schema_outputs_expected_payload() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or("Failed to determine workspace root")?
+        .to_path_buf();
+
+    let schema_path = workspace_root.join("examples/dynamic_length_schema.yaml");
+    let bin_path = unique_temp_path("dynamic_length_data", "bin");
+    fs::write(&bin_path, [3_u8, 0, b'C', b'A', b'T'])?;
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--schema",
+            schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    remove_if_exists(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    assert_eq!(records.len(), 2);
+
+    assert_eq!(records[0].name, "block_len");
+    assert_eq!(records[0].offset, Some(0));
+    assert_eq!(records[0].value.as_u64(), Some(3));
+    assert_eq!(records[0].error, None);
+
+    assert_eq!(records[1].name, "payload");
+    assert_eq!(records[1].offset, Some(2));
+    assert_eq!(records[1].field_type.as_deref(), Some("ascii[3]"));
+    assert_eq!(records[1].value.as_str(), Some("CAT"));
+    assert_eq!(records[1].error, None);
 
     Ok(())
 }

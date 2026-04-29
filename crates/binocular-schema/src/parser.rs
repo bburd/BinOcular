@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
-use crate::ast::{Endianness, FieldDef, FieldType, OffsetKind, Schema};
+use crate::ast::{Endianness, FieldDef, FieldType, LengthSpec, OffsetKind, Schema};
 use crate::error::SchemaError;
 
 pub const MAX_REPEAT_COUNT: u64 = 10_000;
@@ -75,12 +75,24 @@ pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
         }
 
         match field.ty {
-            FieldType::Bytes | FieldType::Ascii => match field.length {
-                Some(length) if length > 0 => {}
-                Some(_) => {
+            FieldType::Bytes | FieldType::Ascii => match &field.length {
+                Some(LengthSpec::Literal(length)) if *length > 0 => {}
+                Some(LengthSpec::Literal(_)) => {
                     return Err(SchemaError::Validation(format!(
                         "{field_label} has length 0; length must be greater than 0"
                     )))
+                }
+                Some(LengthSpec::FieldRef { field: referenced }) => {
+                    if referenced.trim().is_empty() {
+                        return Err(SchemaError::Validation(format!(
+                            "{field_label} references an empty length field name"
+                        )));
+                    }
+                    if field.repeat.is_some() {
+                        return Err(SchemaError::Validation(format!(
+                            "{field_label} cannot use dynamic length together with repeat in schema v1"
+                        )));
+                    }
                 }
                 None => {
                     return Err(SchemaError::Validation(format!(
@@ -281,7 +293,7 @@ mod tests {
                 name: "field1".to_string(),
                 ty: FieldType::Bytes,
                 offset: OffsetKind::Absolute(0),
-                length: Some(4),
+                length: Some(LengthSpec::Literal(4)),
                 endianness: None,
                 description: None,
                 repeat: None,
@@ -363,7 +375,7 @@ mod tests {
     #[test]
     fn validate_schema_rejects_zero_length() {
         let mut schema = base_schema();
-        schema.fields[0].length = Some(0);
+        schema.fields[0].length = Some(LengthSpec::Literal(0));
         let err = validate_schema(&schema).unwrap_err();
         assert!(err.to_string().contains("length 0"));
     }
@@ -444,6 +456,55 @@ fields:
       kind: Absolute
       value: 0
     length: 4
+"#;
+
+        expect_validation_error(yaml);
+    }
+
+    #[test]
+    fn parse_schema_accepts_dynamic_length() {
+        let yaml = r#"
+schema_name: "DynamicLength"
+schema_version: 1
+endianness: little
+fields:
+  - name: "block_len"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 2
+    length:
+      field: "block_len"
+"#;
+
+        let schema = parse_schema_str(yaml).expect("dynamic length should parse");
+        assert!(matches!(
+            schema.fields[1].length,
+            Some(LengthSpec::FieldRef { ref field }) if field == "block_len"
+        ));
+    }
+
+    #[test]
+    fn parse_schema_rejects_dynamic_length_on_repeated_field() {
+        let yaml = r#"
+schema_name: "DynamicRepeated"
+schema_version: 1
+endianness: little
+fields:
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 0
+    length:
+      field: "block_len"
+    repeat:
+      count: 2
 "#;
 
         expect_validation_error(yaml);
@@ -907,6 +968,13 @@ fields:
         ]
     }
 
+    fn arb_length_spec() -> impl Strategy<Value = LengthSpec> {
+        prop_oneof![
+            any::<u64>().prop_map(LengthSpec::Literal),
+            any::<String>().prop_map(|field| LengthSpec::FieldRef { field }),
+        ]
+    }
+
     fn arb_repeat_info() -> impl Strategy<Value = crate::ast::RepeatInfo> {
         any::<u64>().prop_map(|count| crate::ast::RepeatInfo { count })
     }
@@ -916,7 +984,7 @@ fields:
             any::<String>(),
             arb_field_type(),
             arb_offset_kind(),
-            proptest::option::of(any::<u64>()),
+            proptest::option::of(arb_length_spec()),
             proptest::option::of(arb_endianness()),
             proptest::option::of(any::<String>()),
             proptest::option::of(arb_repeat_info()),

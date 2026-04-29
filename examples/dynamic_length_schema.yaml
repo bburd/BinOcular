@@ -1,0 +1,16 @@
+schema_name: "Dynamic Length Example"
+schema_version: 1
+endianness: little
+fields:
+  - name: block_len
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+  - name: payload
+    type: ascii
+    offset:
+      kind: Absolute
+      value: 2
+    length:
+      field: block_len

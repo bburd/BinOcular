@@ -23,6 +23,13 @@ pub enum OffsetKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LengthSpec {
+    Literal(u64),
+    FieldRef { field: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
     U8,
@@ -46,7 +53,7 @@ pub struct FieldDef {
     #[serde(rename = "type")]
     pub ty: FieldType,
     pub offset: OffsetKind,
-    pub length: Option<u64>,
+    pub length: Option<LengthSpec>,
     pub endianness: Option<Endianness>,
     pub description: Option<String>,
     pub repeat: Option<RepeatInfo>,

@@ -17,6 +17,18 @@ pub enum InterpretError {
     #[error("invalid numeric byte width: expected {expected}, got {actual}")]
     InvalidNumericByteWidth { expected: usize, actual: usize },
 
+    #[error("missing dynamic length reference `{field}`")]
+    MissingLengthReference { field: String },
+
+    #[error("field `{field}` cannot be used as a dynamic length source")]
+    InvalidLengthReferenceType { field: String },
+
+    #[error("field `{field}` resolved to a negative dynamic length")]
+    NegativeLengthReference { field: String },
+
+    #[error("field `{field}` resolved to a dynamic length that does not fit in usize")]
+    LengthOverflow { field: String },
+
     #[error("unsupported field type in this core version")]
     Unsupported,
 }
