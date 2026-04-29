@@ -15,9 +15,11 @@ This workspace includes both a CLI and a GUI, with a long-term goal of becoming 
 
 - **Portable** - Windows-first, with Linux/macOS support planned  
 - **Fast & Safe** - Rust's safety guarantees without sacrificing performance  
-- **Schema-Driven** - Describe binary structures using a clean YAML layout format with reusable includes and fixed-count repeats  
+- **Schema-Driven** - Describe binary structures using a clean YAML layout format with reusable includes, fixed-count repeats, dynamic offsets/lengths, and simple integer expressions  
 - **Precise Visualization** - Offsets, endian behavior, integers, strings, blobs  
 - **Repeat Field Support** - Fixed-count repeated fields expanded into multiple rows  
+- **Dynamic Schema References** - Lengths and offsets can resolve from earlier numeric fields  
+- **Structured Integer Expressions** - `add` / `sub` expressions over `const` and `field` values for schema math  
 - **Schema Includes** - Compose schemas from reusable YAML files  
 - **Interactive Highlighting** - Click fields in the GUI to highlight corresponding bytes in the hex view  
 - **GUI Buffer Abstraction** - GUI reads through the same buffer layer used across the workspace  
@@ -27,9 +29,9 @@ This workspace includes both a CLI and a GUI, with a long-term goal of becoming 
 
 ## Project Status
 
-Active development (**v0.4.0**).  
+Active development (**v0.5.0**).  
 The core schema engine, interpreter, CLI, and GUI MVP are functional.  
-Current schema support includes reusable file-based includes and fixed-count repeats, and the GUI supports field-to-byte highlighting on top of the buffer abstraction, memory-mapped backend, and windowed/paged hex-view strategy for large files.
+Current schema support includes reusable file-based includes, fixed-count repeats, dynamic length/offset references, and simple integer expressions. The GUI supports field-to-byte highlighting on top of the buffer abstraction, memory-mapped backend, and windowed/paged hex-view strategy for large files.
 
 ## v0.2.0 Hardening Summary
 
@@ -100,6 +102,30 @@ Current schema support includes reusable file-based includes and fixed-count rep
 - No nested structures or expressions yet
 - No editing or plugin system
 
+## v0.5.0 Dynamic Schema Expressions
+
+**TL;DR:** v0.5.0 teaches schemas how to derive offsets and lengths from earlier fields.
+
+### What changed
+
+- Added dynamic length references via `length: { field: ... }`
+- Added dynamic offset references via `offset: { kind: FieldRef, value: ... }`
+- Added structured integer expressions for `length` and `offset`
+- Supported expression building blocks are `const`, `field`, `add`, and `sub`
+
+### What it means
+
+- Schemas can describe size-prefixed payloads without hard-coding byte counts
+- Schemas can jump to offsets that are stored inside the file itself
+- Small arithmetic adjustments such as `payload_len - 4` or `data_offset + 4` are now declarative
+
+### What didn't change
+
+- Still read-only
+- No conditionals, multiplication/division, or nested structures
+- No scripting or repeat-dependent dynamic stride
+- Repeated fields still cannot use dynamic `length` or `offset` in schema v1
+
 ## Roadmap (High-Level)
 
 - [x] Field interpreter & offset model  
@@ -111,8 +137,10 @@ Current schema support includes reusable file-based includes and fixed-count rep
 - [x] Fixed-count repeat support
 - [x] Schema include support
 - [x] GUI field-to-byte highlighting
+- [x] Dynamic length and offset references
+- [x] Structured integer expressions (`add` / `sub`)
 - [ ] Plugin/interface system  
-- [ ] Advanced schema features (expressions, nested structures)  
+- [ ] Advanced schema features (conditionals, nested structures, richer expression support)  
 
 
 ## Scope (Current vs Out of Scope)
@@ -124,6 +152,9 @@ BinOcular is currently **read-only**. It is a binary inspection tool, **not** a 
 - Schema-driven parsing and field interpretation
 - Fixed-count repeats
 - File-based schema composition
+- Dynamic length references
+- Dynamic offset references
+- Structured integer expressions for `length` and `offset`
 - GUI buffer abstraction
 - mmap backend for large files
 - Windowed/paged hex viewing
@@ -133,7 +164,9 @@ BinOcular is currently **read-only**. It is a binary inspection tool, **not** a 
 
 - Nested schemas
 - Conditional fields
-- Expressions
+- Multiplication/division in expressions
+- Scripting
+- Repeat-dependent dynamic stride
 - Plugins
 - Full virtual scrolling
 - Editing bytes
@@ -176,14 +209,55 @@ schema_name: "Packet"
 schema_version: 1
 endianness: little
 fields:
-  - name: "magic"
-    type: u32
+  - name: "header_len"
+    type: u16
     offset: { kind: Absolute, value: 0 }
+  - name: "data_offset"
+    type: u32
+    offset: { kind: Absolute, value: 2 }
+  - name: "payload_len"
+    type: u16
+    offset: { kind: Absolute, value: 6 }
   - name: "payload"
+    type: bytes
+    offset: { kind: FieldRef, value: data_offset }
+    length:
+      expr:
+        op: sub
+        left:
+          field: "payload_len"
+        right:
+          const: 4
+  - name: "tag"
     type: ascii
-    offset: { kind: Absolute, value: 4 }
-    length: 5
+    offset:
+      kind: Expr
+      value:
+        op: add
+        left:
+          field: "data_offset"
+        right:
+          const: 4
+    length: 3
 ```
+
+### Schema expression syntax
+
+- `length` supports:
+  - literal values such as `length: 5`
+  - field references such as `length: { field: block_len }`
+  - expressions such as `length: { expr: { op: sub, left: { field: block_len }, right: { const: 4 } } }`
+- `offset` supports:
+  - absolute values such as `offset: { kind: Absolute, value: 0 }`
+  - field references such as `offset: { kind: FieldRef, value: data_offset }`
+  - expressions such as `offset: { kind: Expr, value: { op: add, left: { field: data_offset }, right: { const: 4 } } }`
+- Supported integer expression pieces are:
+  - `op: add`
+  - `op: sub`
+  - `{ const: N }`
+  - `{ field: field_name }`
+
+Still out of scope in v0.5.0: conditionals, multiplication/division, nested structs, scripting, and repeat-dependent dynamic stride.
 
 ### Example binary & inspection
 
@@ -191,8 +265,12 @@ fields:
 # Create sample binary
 python - <<'PY'
 with open('packet.bin', 'wb') as f:
-    f.write((0xABCD1234).to_bytes(4, 'little'))
-    f.write(b'hello')
+    f.write((12).to_bytes(2, 'little'))   # header_len
+    f.write((16).to_bytes(4, 'little'))   # data_offset
+    f.write((7).to_bytes(2, 'little'))    # payload_len
+    f.write(b'\x00' * 8)                  # padding up to offset 16
+    f.write(b'CAT')                       # payload (7 - 4)
+    f.write(b'END')                       # tag at data_offset + 4
 PY
 
 # Render structured table view
@@ -205,9 +283,12 @@ cargo run -p binocular-cli -- --schema packet.yml packet.bin --json
 ### Example output
 
 ```
-NAME    | OFFSET            | TYPE       | VALUE                          | ERROR
-magic   | 0 (0x00000000)    | u32        | 2882343476 (0xABCD1234)        | -
-payload | 4 (0x00000004)    | ascii[5]   | "hello"                        | -
+NAME       | OFFSET            | TYPE        | VALUE                          | ERROR
+header_len | 0 (0x00000000)    | u16         | 12                             | -
+data_offset| 2 (0x00000002)    | u32         | 16                             | -
+payload_len| 6 (0x00000006)    | u16         | 7                              | -
+payload    | 16 (0x00000010)   | bytes[3]    | 43 41 54                       | -
+tag        | 20 (0x00000014)   | ascii[3]    | "END"                          | -
 ```
 
 ## GUI
