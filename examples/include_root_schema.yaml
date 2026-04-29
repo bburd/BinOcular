@@ -1,0 +1,22 @@
+schema_name: "include_example"
+schema_version: 1
+endianness: little
+fields:
+  - name: magic16
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+  - include: "include_common.yaml"
+  - name: label
+    type: ascii
+    offset:
+      kind: Absolute
+      value: 10
+    length: 10
+  - name: tail
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 20
+    length: 6

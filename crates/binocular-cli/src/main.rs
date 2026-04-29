@@ -14,7 +14,7 @@ use anyhow::Context;
 use binocular_core::buffer::MemoryBuffer;
 use binocular_core::interpret::{interpret_schema, FieldValue};
 use binocular_schema::ast::{FieldDef, FieldType};
-use binocular_schema::parser::parse_schema_str;
+use binocular_schema::parser::parse_schema_file;
 use clap::Parser;
 use serde_json::json;
 
@@ -83,8 +83,7 @@ fn main() -> anyhow::Result<()> {
         .context("--schema is required unless --branding is set")?;
 
     let file_bytes = fs::read(file)?;
-    let schema_str = fs::read_to_string(schema)?;
-    let schema = match parse_schema_str(&schema_str) {
+    let schema = match parse_schema_file(schema) {
         Ok(schema) => schema,
         Err(err) => {
             eprintln!("Failed to parse schema: {err}");

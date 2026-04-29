@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf, sync::Arc};
 use binocular_core::buffer::{FileBuffer, MemoryBuffer, MmapBuffer};
 use binocular_core::interpret::{interpret_schema, FieldEval, FieldValue};
 use binocular_schema::ast::Schema;
-use binocular_schema::parser::parse_schema_str;
+use binocular_schema::parser::parse_schema_file;
 use eframe::egui;
 
 const HEX_PAGE_SIZE: usize = 1024;
@@ -69,16 +69,7 @@ impl BinOcularApp {
             return;
         };
 
-        let schema_str = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(err) => {
-                doc.last_error = Some(format!("Failed to read schema file: {err}"));
-                doc.last_error_is_offset = false;
-                return;
-            }
-        };
-
-        let schema = match parse_schema_str(&schema_str) {
+        let schema = match parse_schema_file(&path) {
             Ok(schema) => schema,
             Err(err) => {
                 doc.last_error = Some(format!("Failed to parse or validate schema: {err}"));
@@ -147,16 +138,7 @@ impl BinOcularApp {
             return;
         };
 
-        let schema_str = match fs::read_to_string(&schema_path) {
-            Ok(contents) => contents,
-            Err(err) => {
-                doc.last_error = Some(format!("Failed to read schema file: {err}"));
-                doc.last_error_is_offset = false;
-                return;
-            }
-        };
-
-        let schema = match parse_schema_str(&schema_str) {
+        let schema = match parse_schema_file(&schema_path) {
             Ok(schema) => schema,
             Err(err) => {
                 doc.last_error = Some(format!("Failed to parse or validate schema: {err}"));
@@ -185,6 +167,10 @@ impl Document {
     }
 
     fn select_field(&mut self, name: String, offset: u64, byte_len: usize) {
+        eprintln!(
+            "select_field: doc={:p} name={} offset=0x{:X} len={}",
+            self, name, offset, byte_len
+        );
         self.selected_field_name = Some(name);
         self.selected_field_range = Some((offset, byte_len));
 
@@ -312,26 +298,51 @@ fn draw_field_table(
             for eval in evaluations {
                 let is_selected = selected_range
                     .is_some_and(|selected| selected == (eval.resolved_offset, eval.byte_len));
+                let mut row_clicked = false;
+
                 let response = ui.selectable_label(is_selected, &eval.display_name);
-                if response.clicked() {
+                row_clicked |= response.clicked();
+
+                let response = ui.selectable_label(
+                    is_selected,
+                    egui::RichText::new(format_resolved_offset(eval.resolved_offset)).monospace(),
+                );
+                row_clicked |= response.clicked();
+
+                let response = ui.selectable_label(is_selected, format!("{:?}", eval.field.ty));
+                row_clicked |= response.clicked();
+
+                if let Some(value) = &eval.value {
+                    let response = ui.selectable_label(is_selected, format_value(value));
+                    row_clicked |= response.clicked();
+                } else {
+                    let response = ui.selectable_label(is_selected, "-");
+                    row_clicked |= response.clicked();
+                }
+
+                if let Some(error) = &eval.error {
+                    let response = ui.selectable_label(
+                        is_selected,
+                        egui::RichText::new(error).color(ui.visuals().error_fg_color),
+                    );
+                    row_clicked |= response.clicked();
+                } else {
+                    let response = ui.selectable_label(is_selected, "-");
+                    row_clicked |= response.clicked();
+                }
+
+                if row_clicked {
+                    eprintln!(
+                        "field row clicked: name={} offset=0x{:X} len={}",
+                        eval.display_name, eval.resolved_offset, eval.byte_len
+                    );
                     clicked_field = Some((
                         eval.display_name.clone(),
                         eval.resolved_offset,
                         eval.byte_len,
                     ));
                 }
-                ui.monospace(format_resolved_offset(eval.resolved_offset));
-                ui.label(format!("{:?}", eval.field.ty));
-                if let Some(value) = &eval.value {
-                    ui.label(format_value(value));
-                } else {
-                    ui.label("-");
-                }
-                if let Some(error) = &eval.error {
-                    ui.colored_label(ui.visuals().error_fg_color, error);
-                } else {
-                    ui.label("-");
-                }
+
                 ui.end_row();
             }
         });

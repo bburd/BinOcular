@@ -1,0 +1,15 @@
+schema_name: "Included Common"
+schema_version: 1
+endianness: little
+fields:
+  - name: code32
+    type: u32
+    offset:
+      kind: Absolute
+      value: 2
+    endianness: big
+  - name: delta
+    type: i32
+    offset:
+      kind: Absolute
+      value: 6

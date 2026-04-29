@@ -25,6 +25,10 @@ fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
     ))
 }
 
+fn remove_if_exists(path: &PathBuf) {
+    let _ = fs::remove_file(path);
+}
+
 #[test]
 fn simple_schema_outputs_expected_values() -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -110,8 +114,8 @@ fields:
         ])
         .output()?;
 
-    let _ = fs::remove_file(&schema_path);
-    let _ = fs::remove_file(&bin_path);
+    remove_if_exists(&schema_path);
+    remove_if_exists(&bin_path);
 
     assert!(output.status.success(), "CLI did not exit successfully");
 
@@ -130,6 +134,99 @@ fields:
     assert_eq!(records[2].name, "value[2]");
     assert_eq!(records[2].offset, Some(4));
     assert_eq!(records[2].value.as_u64(), Some(3));
+
+    Ok(())
+}
+
+#[test]
+fn included_schema_outputs_expected_field_order() -> Result<(), Box<dyn std::error::Error>> {
+    let root_schema_path = unique_temp_path("include_root_schema", "yaml");
+    let common_schema_path = unique_temp_path("include_common_schema", "yaml");
+    let bin_path = unique_temp_path("include_data", "bin");
+
+    let root_schema = format!(
+        r#"
+schema_name: "Root"
+schema_version: 1
+endianness: little
+fields:
+  - name: "magic"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+  - include: "{}"
+  - name: "tail"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 6
+    length: 2
+"#,
+        common_schema_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("Invalid include file name")?
+    );
+
+    let common_schema = r#"
+schema_name: "Common"
+schema_version: 1
+endianness: little
+fields:
+  - name: "version"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 2
+  - name: "flags"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 4
+"#;
+
+    fs::write(&root_schema_path, root_schema)?;
+    fs::write(&common_schema_path, common_schema)?;
+    fs::write(
+        &bin_path,
+        [0x34_u8, 0x12, 0x78, 0x56, 0xBC, 0x9A, 0xDE, 0xF0],
+    )?;
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--schema",
+            root_schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    remove_if_exists(&root_schema_path);
+    remove_if_exists(&common_schema_path);
+    remove_if_exists(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    assert_eq!(records.len(), 4);
+
+    assert_eq!(records[0].name, "magic");
+    assert_eq!(records[0].offset, Some(0));
+    assert_eq!(records[0].value.as_u64(), Some(0x1234));
+
+    assert_eq!(records[1].name, "version");
+    assert_eq!(records[1].offset, Some(2));
+    assert_eq!(records[1].value.as_u64(), Some(0x5678));
+
+    assert_eq!(records[2].name, "flags");
+    assert_eq!(records[2].offset, Some(4));
+    assert_eq!(records[2].value.as_u64(), Some(0x9ABC));
+
+    assert_eq!(records[3].name, "tail");
+    assert_eq!(records[3].offset, Some(6));
+    assert_eq!(records[3].value.as_str(), Some("DE F0"));
 
     Ok(())
 }

@@ -1,7 +1,35 @@
-use crate::ast::{FieldType, OffsetKind, Schema};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use serde_yaml::{Mapping, Value};
+
+use crate::ast::{Endianness, FieldDef, FieldType, OffsetKind, Schema};
 use crate::error::SchemaError;
 
 pub const MAX_REPEAT_COUNT: u64 = 10_000;
+
+#[derive(Debug, Deserialize)]
+struct RawSchemaDoc {
+    schema_name: String,
+    schema_version: u32,
+    endianness: Option<Endianness>,
+    fields: Vec<Value>,
+}
+
+#[derive(Debug)]
+struct RawSchema {
+    schema_name: String,
+    schema_version: u32,
+    endianness: Option<Endianness>,
+    fields: Vec<RawFieldItem>,
+}
+
+#[derive(Debug)]
+enum RawFieldItem {
+    Field(FieldDef),
+    Include { include: String },
+}
 
 pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
     if schema.schema_name.trim().is_empty() {
@@ -76,18 +104,173 @@ pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
 }
 
 pub fn parse_schema_str(yaml: &str) -> Result<Schema, SchemaError> {
-    let schema: Schema =
-        serde_yaml::from_str(yaml).map_err(|e| SchemaError::Yaml(e.to_string()))?;
+    let raw = parse_raw_schema_str(yaml)?;
+    if contains_include(&raw) {
+        return Err(SchemaError::Validation(
+            "Schema includes require file-based loading via parse_schema_file".to_string(),
+        ));
+    }
+
+    let schema = schema_from_raw(raw, Vec::new());
     validate_schema(&schema)?;
     Ok(schema)
+}
+
+pub fn parse_schema_file(path: impl AsRef<Path>) -> Result<Schema, SchemaError> {
+    let path = absolutize_path(path.as_ref())?;
+    let mut stack = Vec::new();
+    parse_schema_file_inner(&path, &mut stack)
+}
+
+fn parse_schema_file_inner(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Schema, SchemaError> {
+    let normalized = normalize_for_cycle(path)?;
+
+    if let Some(cycle_start) = stack.iter().position(|seen| seen == &normalized) {
+        let cycle = stack[cycle_start..]
+            .iter()
+            .chain(std::iter::once(&normalized))
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        return Err(SchemaError::IncludeCycle { cycle });
+    }
+
+    stack.push(normalized.clone());
+
+    let result = (|| {
+        let yaml = fs::read_to_string(&normalized).map_err(|source| SchemaError::Io {
+            path: normalized.clone(),
+            source,
+        })?;
+        let raw = parse_raw_schema_str(&yaml)?;
+        let base_dir = normalized
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let mut fields = Vec::new();
+        for item in raw.fields {
+            match item {
+                RawFieldItem::Field(field) => fields.push(field),
+                RawFieldItem::Include { include } => {
+                    let include_path = base_dir.join(include);
+                    let included_schema = parse_schema_file_inner(&include_path, stack)?;
+                    fields.extend(included_schema.fields);
+                }
+            }
+        }
+
+        let schema = Schema {
+            schema_name: raw.schema_name,
+            schema_version: raw.schema_version,
+            endianness: raw.endianness,
+            fields,
+        };
+        validate_schema(&schema)?;
+        Ok(schema)
+    })();
+
+    stack.pop();
+    result
+}
+
+fn parse_raw_schema_str(yaml: &str) -> Result<RawSchema, SchemaError> {
+    let raw_doc: RawSchemaDoc =
+        serde_yaml::from_str(yaml).map_err(|e| SchemaError::Yaml(e.to_string()))?;
+
+    let fields = raw_doc
+        .fields
+        .into_iter()
+        .map(parse_raw_field_item)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(RawSchema {
+        schema_name: raw_doc.schema_name,
+        schema_version: raw_doc.schema_version,
+        endianness: raw_doc.endianness,
+        fields,
+    })
+}
+
+fn parse_raw_field_item(value: Value) -> Result<RawFieldItem, SchemaError> {
+    let mapping = value.as_mapping().ok_or_else(|| {
+        SchemaError::Yaml("invalid type: expected a mapping for each field item".to_string())
+    })?;
+
+    if let Some(include_value) = find_string_key(mapping, "include") {
+        if mapping.len() != 1 {
+            return Err(SchemaError::Validation(
+                "Include items must contain exactly one key: `include`".to_string(),
+            ));
+        }
+
+        if include_value.trim().is_empty() {
+            return Err(SchemaError::Validation(
+                "Include path must not be empty".to_string(),
+            ));
+        }
+
+        return Ok(RawFieldItem::Include {
+            include: include_value.to_string(),
+        });
+    }
+
+    let field =
+        serde_yaml::from_value::<FieldDef>(value).map_err(|e| SchemaError::Yaml(e.to_string()))?;
+    Ok(RawFieldItem::Field(field))
+}
+
+fn contains_include(raw: &RawSchema) -> bool {
+    raw.fields
+        .iter()
+        .any(|item| matches!(item, RawFieldItem::Include { .. }))
+}
+
+fn schema_from_raw(raw: RawSchema, mut fields: Vec<FieldDef>) -> Schema {
+    for item in raw.fields {
+        if let RawFieldItem::Field(field) = item {
+            fields.push(field);
+        }
+    }
+
+    Schema {
+        schema_name: raw.schema_name,
+        schema_version: raw.schema_version,
+        endianness: raw.endianness,
+        fields,
+    }
+}
+
+fn find_string_key<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a str> {
+    mapping
+        .get(Value::String(key.to_string()))
+        .and_then(Value::as_str)
+}
+
+fn absolutize_path(path: &Path) -> Result<PathBuf, SchemaError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let cwd = std::env::current_dir().map_err(|source| SchemaError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(cwd.join(path))
+}
+
+fn normalize_for_cycle(path: &Path) -> Result<PathBuf, SchemaError> {
+    let absolute = absolutize_path(path)?;
+    Ok(fs::canonicalize(&absolute).unwrap_or(absolute))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Endianness, FieldDef, OffsetKind, RepeatInfo};
+    use crate::ast::{FieldDef, RepeatInfo};
     use proptest::prelude::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn base_schema() -> Schema {
         Schema {
@@ -208,6 +391,20 @@ fields:
         let schema = parse_schema_str(yaml).expect("valid schema should parse");
         assert_eq!(schema.schema_name, "Packet");
         assert_eq!(schema.fields.len(), 2);
+    }
+
+    #[test]
+    fn parse_schema_str_rejects_include_usage() {
+        let yaml = r#"
+schema_name: "Packet"
+schema_version: 1
+endianness: little
+fields:
+  - include: "common.yaml"
+"#;
+
+        let err = parse_schema_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("file-based loading"));
     }
 
     fn expect_validation_error(yaml: &str) {
@@ -347,6 +544,345 @@ fields:
         expect_validation_error(&yaml);
     }
 
+    #[test]
+    fn parse_schema_file_preserves_include_field_order() {
+        let dir = temp_test_dir("include_order");
+        write_file(
+            dir.join("root.yaml"),
+            r#"
+schema_name: "Root"
+schema_version: 1
+endianness: little
+fields:
+  - name: "magic"
+    type: u32
+    offset:
+      kind: Absolute
+      value: 0
+  - include: "common.yaml"
+  - name: "tail"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 16
+    length: 4
+"#,
+        );
+        write_file(
+            dir.join("common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+endianness: little
+fields:
+  - name: "version"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 4
+  - name: "flags"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 6
+"#,
+        );
+
+        let schema = parse_schema_file(dir.join("root.yaml")).expect("include should resolve");
+        let names = schema
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["magic", "version", "flags", "tail"]);
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_file_supports_nested_relative_includes() {
+        let dir = temp_test_dir("nested_include");
+        write_file(
+            dir.join("root.yaml"),
+            r#"
+schema_name: "Root"
+schema_version: 1
+endianness: little
+fields:
+  - include: "parts/common.yaml"
+  - name: "tail"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 12
+    length: 2
+"#,
+        );
+        write_file(
+            dir.join("parts/common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+endianness: little
+fields:
+  - name: "magic"
+    type: u32
+    offset:
+      kind: Absolute
+      value: 0
+  - include: "../shared/more.yaml"
+"#,
+        );
+        write_file(
+            dir.join("shared/more.yaml"),
+            r#"
+schema_name: "More"
+schema_version: 1
+endianness: little
+fields:
+  - name: "value"
+    type: u32
+    offset:
+      kind: Absolute
+      value: 4
+"#,
+        );
+
+        let schema = parse_schema_file(dir.join("root.yaml")).expect("nested include should work");
+        let names = schema
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["magic", "value", "tail"]);
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_file_rejects_missing_include_file() {
+        let dir = temp_test_dir("missing_include");
+        write_file(
+            dir.join("root.yaml"),
+            r#"
+schema_name: "Root"
+schema_version: 1
+endianness: little
+fields:
+  - include: "missing.yaml"
+"#,
+        );
+
+        let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
+        assert!(matches!(err, SchemaError::Io { .. }));
+        assert!(err.to_string().contains("missing.yaml"));
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_file_rejects_include_cycles() {
+        let dir = temp_test_dir("include_cycle");
+        write_file(
+            dir.join("a.yaml"),
+            r#"
+schema_name: "A"
+schema_version: 1
+endianness: little
+fields:
+  - include: "b.yaml"
+"#,
+        );
+        write_file(
+            dir.join("b.yaml"),
+            r#"
+schema_name: "B"
+schema_version: 1
+endianness: little
+fields:
+  - include: "a.yaml"
+"#,
+        );
+
+        let err = parse_schema_file(dir.join("a.yaml")).unwrap_err();
+        assert!(matches!(err, SchemaError::IncludeCycle { .. }));
+        assert!(err.to_string().contains("cycle"));
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_file_rejects_include_items_with_extra_keys() {
+        let dir = temp_test_dir("include_extra_keys");
+        write_file(
+            dir.join("root.yaml"),
+            r#"
+schema_name: "Root"
+schema_version: 1
+endianness: little
+fields:
+  - include: "common.yaml"
+    offset: 10
+"#,
+        );
+        write_file(
+            dir.join("common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+endianness: little
+fields:
+  - name: "value"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 0
+"#,
+        );
+
+        let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
+        assert!(matches!(err, SchemaError::Validation(_)));
+        assert!(err.to_string().contains("exactly one key"));
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_file_accepts_valid_repeat_in_included_fields() {
+        let dir = temp_test_dir("include_repeat_valid");
+        write_file(
+            dir.join("root.yaml"),
+            r#"
+schema_name: "Root"
+schema_version: 1
+endianness: little
+fields:
+  - include: "common.yaml"
+"#,
+        );
+        write_file(
+            dir.join("common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+endianness: little
+fields:
+  - name: "values"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 0
+    repeat:
+      count: 3
+"#,
+        );
+
+        let schema = parse_schema_file(dir.join("root.yaml")).expect("repeat should be valid");
+        assert_eq!(
+            schema.fields[0].repeat.as_ref().map(|repeat| repeat.count),
+            Some(3)
+        );
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_file_rejects_invalid_repeat_in_included_fields() {
+        let dir = temp_test_dir("include_repeat_invalid");
+        write_file(
+            dir.join("root.yaml"),
+            r#"
+schema_name: "Root"
+schema_version: 1
+endianness: little
+fields:
+  - include: "common.yaml"
+"#,
+        );
+        write_file(
+            dir.join("common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+endianness: little
+fields:
+  - name: "values"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 0
+    repeat:
+      count: 0
+"#,
+        );
+
+        let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
+        assert!(matches!(err, SchemaError::Validation(_)));
+        assert!(err.to_string().contains("repeat count 0"));
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_file_rejects_expression_offsets_in_included_fields() {
+        let dir = temp_test_dir("include_expr_offset");
+        write_file(
+            dir.join("root.yaml"),
+            r#"
+schema_name: "Root"
+schema_version: 1
+endianness: little
+fields:
+  - include: "common.yaml"
+"#,
+        );
+        write_file(
+            dir.join("common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+endianness: little
+fields:
+  - name: "value"
+    type: u16
+    offset:
+      kind: Expr
+      value: "a+b"
+"#,
+        );
+
+        let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
+        assert!(matches!(err, SchemaError::Validation(_)));
+        assert!(err.to_string().contains("expression offset"));
+
+        cleanup_test_dir(dir);
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "binocular_schema_{prefix}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        dir
+    }
+
+    fn write_file(path: PathBuf, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("failed to create parent directory");
+        }
+        fs::write(path, contents).expect("failed to write test file");
+    }
+
+    fn cleanup_test_dir(dir: PathBuf) {
+        let _ = fs::remove_dir_all(dir);
+    }
+
     fn arb_endianness() -> impl Strategy<Value = Endianness> {
         prop_oneof![Just(Endianness::Little), Just(Endianness::Big),]
     }
@@ -371,8 +907,8 @@ fields:
         ]
     }
 
-    fn arb_repeat_info() -> impl Strategy<Value = RepeatInfo> {
-        any::<u64>().prop_map(|count| RepeatInfo { count })
+    fn arb_repeat_info() -> impl Strategy<Value = crate::ast::RepeatInfo> {
+        any::<u64>().prop_map(|count| crate::ast::RepeatInfo { count })
     }
 
     fn arb_field_def() -> impl Strategy<Value = FieldDef> {
@@ -421,6 +957,7 @@ fields:
 
             match caught.expect("already checked is_ok") {
                 Ok(_) | Err(SchemaError::Yaml(_)) | Err(SchemaError::Validation(_)) => {}
+                Err(other) => prop_assert!(false, "unexpected error variant: {:?}", other),
             }
         }
 
