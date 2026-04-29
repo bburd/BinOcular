@@ -7,6 +7,7 @@ use binocular_schema::parser::parse_schema_str;
 use eframe::egui;
 
 const HEX_PAGE_SIZE: usize = 1024;
+const HEX_VIEW_HEIGHT: f32 = 300.0;
 const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 struct Document {
@@ -203,6 +204,8 @@ impl Document {
 
 fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
     const BYTES_PER_ROW: usize = 16;
+    const SELECTED_BYTE_BG: egui::Color32 = egui::Color32::from_rgb(255, 196, 0);
+    const SELECTED_BYTE_FG: egui::Color32 = egui::Color32::from_rgb(24, 24, 24);
     let remaining = doc.size.saturating_sub(doc.hex_start_offset);
     let to_show = remaining.min(HEX_PAGE_SIZE as u64) as usize;
 
@@ -256,7 +259,9 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
 
                     let mut byte_text = egui::RichText::new(format!("{byte:02X}")).monospace();
                     if is_selected {
-                        byte_text = byte_text.background_color(ui.visuals().selection.bg_fill);
+                        byte_text = byte_text
+                            .background_color(SELECTED_BYTE_BG)
+                            .color(SELECTED_BYTE_FG);
                     }
                     ui.label(byte_text);
                 } else {
@@ -467,7 +472,11 @@ impl eframe::App for BinOcularApp {
                     {
                         ui.label(format!("Selected: {name} @ 0x{offset:08X} (len {len})"));
                     }
-                    draw_hex_view(ui, doc);
+                    egui::ScrollArea::vertical()
+                        .max_height(HEX_VIEW_HEIGHT)
+                        .show(ui, |ui| {
+                            draw_hex_view(ui, doc);
+                        });
 
                     if doc.schema.is_some() {
                         ui.separator();
