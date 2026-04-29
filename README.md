@@ -1,32 +1,35 @@
 <p align="center">
   <img src="crates/binocular-cli/assets/images/banner.png" alt="BinOcular banner" width="600" />
 </p>
-<p align="center"><i>BinOcular — Know your bytes. Don’t guess them.</i></p>
+<p align="center"><i>BinOcular - Know your bytes. Don't guess them.</i></p>
 
 # BinOcular
 *A schema-driven binary inspection toolkit for developers, reverse-engineers, and anyone who wants to stop guessing about byte layouts.*
 
 BinOcular is a portable, cross-platform binary analysis toolkit written in Rust.  
-It provides a structured, declarative way to explore unknown binary formats, visualize data layouts, and build custom parsers — without guesswork or hex-editor archaeology.
+It provides a structured, declarative way to explore unknown binary formats, visualize data layouts, and build custom parsers - without guesswork or hex-editor archaeology.
 
 This workspace includes both a CLI and a GUI, with a long-term goal of becoming a robust open-source binary inspection suite.
 
 ## Features
 
-- **Portable** — Windows-first, with Linux/macOS support planned  
-- **Fast & Safe** — Rust’s safety guarantees without sacrificing performance  
-- **Schema-Driven** — Describe binary structures using a clean YAML layout format  
-- **Precise Visualization** — Offsets, endian behavior, integers, strings, blobs  
-- **GUI Buffer Abstraction** — GUI reads through the same buffer layer used across the workspace  
-- **Large-File mmap Backend** — Memory-mapped backend for efficient access to large binaries  
-- **Windowed/Paged Hex View** — Hex display reads a page/window at a time instead of loading whole files  
-- **Developer-Friendly** — CLI output (table or JSON) for automation and testing  
+- **Portable** - Windows-first, with Linux/macOS support planned  
+- **Fast & Safe** - Rust's safety guarantees without sacrificing performance  
+- **Schema-Driven** - Describe binary structures using a clean YAML layout format with reusable includes and fixed-count repeats  
+- **Precise Visualization** - Offsets, endian behavior, integers, strings, blobs  
+- **Repeat Field Support** - Fixed-count repeated fields expanded into multiple rows  
+- **Schema Includes** - Compose schemas from reusable YAML files  
+- **Interactive Highlighting** - Click fields in the GUI to highlight corresponding bytes in the hex view  
+- **GUI Buffer Abstraction** - GUI reads through the same buffer layer used across the workspace  
+- **Large-File mmap Backend** - Memory-mapped backend for efficient access to large binaries  
+- **Windowed/Paged Hex View** - Hex display reads a page/window at a time instead of loading whole files  
+- **Developer-Friendly** - CLI output (table or JSON) for automation and testing  
 
 ## Project Status
 
-Active development (**v0.3.0**).  
+Active development (**v0.4.0**).  
 The core schema engine, interpreter, CLI, and GUI MVP are functional.  
-Current GUI architecture uses a buffer abstraction with a memory-mapped backend and a windowed/paged hex-view strategy for large files.
+Current schema support includes reusable file-based includes and fixed-count repeats, and the GUI supports field-to-byte highlighting on top of the buffer abstraction, memory-mapped backend, and windowed/paged hex-view strategy for large files.
 
 ## v0.2.0 Hardening Summary
 
@@ -74,6 +77,29 @@ Current GUI architecture uses a buffer abstraction with a memory-mapped backend 
 - No schema expansion
 - No plugins or editing features
 
+## v0.4.0 Schema & Interaction Features
+
+**TL;DR:** v0.4.0 adds real schema composition and interactive inspection.
+
+### What changed
+
+- Added fixed-count repeat support (`repeat: { count: N }`)
+- Added file-based schema includes (`include: path.yaml`)
+- GUI now supports clicking fields to highlight bytes in the hex view
+- Interpreter now expands repeated fields into multiple rows
+
+### What it means
+
+- Schemas can now model real-world binary layouts more accurately
+- Shared schema components can be reused across files
+- GUI interaction now directly connects structure to raw bytes
+
+### What didn't change
+
+- Still read-only
+- No nested structures or expressions yet
+- No editing or plugin system
+
 ## Roadmap (High-Level)
 
 - [x] Field interpreter & offset model  
@@ -82,8 +108,11 @@ Current GUI architecture uses a buffer abstraction with a memory-mapped backend 
 - [x] GUI MVP (hex view + interpreted fields)  
 - [x] Paging-backed hex viewer for large files  
 - [x] Property tests and fuzzing hardening
+- [x] Fixed-count repeat support
+- [x] Schema include support
+- [x] GUI field-to-byte highlighting
 - [ ] Plugin/interface system  
-- [ ] Advanced schema features (arrays, expressions, nested structures)  
+- [ ] Advanced schema features (expressions, nested structures)  
 
 
 ## Scope (Current vs Out of Scope)
@@ -93,15 +122,18 @@ BinOcular is currently **read-only**. It is a binary inspection tool, **not** a 
 ### In Scope (Current)
 
 - Schema-driven parsing and field interpretation
+- Fixed-count repeats
+- File-based schema composition
 - GUI buffer abstraction
 - mmap backend for large files
 - Windowed/paged hex viewing
+- GUI field-to-byte highlighting
 
 ### Explicitly Out of Scope (Current)
 
-- Arrays/repeats
 - Nested schemas
 - Conditional fields
+- Expressions
 - Plugins
 - Full virtual scrolling
 - Editing bytes
@@ -109,10 +141,10 @@ BinOcular is currently **read-only**. It is a binary inspection tool, **not** a 
 
 ## Workspace Layout
 
-- `crates/binocular-core` — core buffer abstractions and field interpreter  
-- `crates/binocular-schema` — YAML AST, parser, and schema validation  
-- `crates/binocular-cli` — command-line tool for inspecting binaries  
-- `crates/binocular-gui` — egui desktop application  
+- `crates/binocular-core` - core buffer abstractions and field interpreter  
+- `crates/binocular-schema` - YAML AST, parser, and schema validation  
+- `crates/binocular-cli` - command-line tool for inspecting binaries  
+- `crates/binocular-gui` - egui desktop application  
 
 ## Quickstart
 
@@ -186,6 +218,7 @@ The GUI is a lightweight egui desktop application that can:
 - Load YAML schemas
 - Display and navigate paged hex windows
 - Show interpreted fields
+- Highlight corresponding bytes when fields are clicked
 
 ```bash
 cargo run -p binocular-gui
@@ -196,8 +229,8 @@ More advanced visualizations are planned; current large-file handling uses mmap 
 ## Contributing
 
 BinOcular is still evolving.  
-Issues, ideas, and design discussions are welcome — especially around schema clarity, new field types, UX, and testing.
+Issues, ideas, and design discussions are welcome - especially around schema clarity, new field types, UX, and testing.
 
 ## License
 
-MIT License — see [`LICENSE`](LICENSE) for details.
+MIT License - see [`LICENSE`](LICENSE) for details.
