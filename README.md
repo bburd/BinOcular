@@ -2,6 +2,17 @@
   <img src="crates/binocular-cli/assets/images/banner.png" alt="BinOcular banner" width="600" />
 </p>
 <p align="center"><i>BinOcular - Know your bytes. Don't guess them.</i></p>
+<p align="center">
+  <a href="https://github.com/bburd/BinOcular/actions/workflows/ci.yml">
+    <img src="https://github.com/bburd/BinOcular/actions/workflows/ci.yml/badge.svg" alt="CI" />
+  </a>
+  <a href="https://github.com/bburd/BinOcular/releases">
+    <img src="https://img.shields.io/github/v/release/bburd/BinOcular?label=release" alt="Latest release" />
+  </a>
+  <a href="https://github.com/bburd/BinOcular/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/bburd/BinOcular" alt="License" />
+  </a>
+</p>
 
 # BinOcular
 
