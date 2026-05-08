@@ -10,6 +10,7 @@ const HEX_PAGE_SIZE: usize = 1024;
 const HEX_VIEW_HEIGHT: f32 = 300.0;
 const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DISPLAY_BYTES: usize = 256;
+const SEARCH_CHUNK_SIZE: usize = 64 * 1024;
 
 struct Document {
     _path: PathBuf,
@@ -25,6 +26,10 @@ struct Document {
     hex_offset_input: String,
     selected_field_range: Option<(u64, usize)>,
     selected_field_name: Option<String>,
+    search_query: String,
+    active_search_query: String,
+    search_matches: Vec<u64>,
+    current_search_match: Option<usize>,
 }
 
 struct BinOcularApp {
@@ -121,6 +126,10 @@ impl BinOcularApp {
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
             selected_field_name: None,
+            search_query: String::new(),
+            active_search_query: String::new(),
+            search_matches: Vec::new(),
+            current_search_match: None,
         })
     }
 
@@ -187,12 +196,105 @@ impl Document {
             self.hex_offset_input = format!("0x{:X}", new_offset);
         }
     }
+
+    fn find_search_matches(&mut self) -> Result<(), String> {
+        if self.search_query.is_empty() {
+            return Ok(());
+        }
+
+        let query = self.search_query.clone();
+        let matches = find_ascii_matches(self.buffer.as_ref(), self.size, query.as_bytes())?;
+        self.active_search_query = query;
+        self.search_matches = matches;
+        self.current_search_match = None;
+
+        if !self.search_matches.is_empty() {
+            self.select_search_match(0);
+        }
+
+        Ok(())
+    }
+
+    fn clear_search(&mut self) {
+        self.search_query.clear();
+        self.active_search_query.clear();
+        self.search_matches.clear();
+        self.current_search_match = None;
+    }
+
+    fn select_search_match(&mut self, index: usize) {
+        if self.search_matches.is_empty() {
+            self.current_search_match = None;
+            return;
+        }
+
+        let index = index % self.search_matches.len();
+        self.current_search_match = Some(index);
+
+        let offset = self.search_matches[index];
+        let page_end = self.hex_start_offset.saturating_add(HEX_PAGE_SIZE as u64);
+        if offset < self.hex_start_offset || offset >= page_end {
+            let max_start = self.size.saturating_sub(HEX_PAGE_SIZE as u64);
+            let new_offset = offset.min(max_start);
+            self.hex_start_offset = new_offset;
+            self.hex_offset_input = format!("0x{:X}", new_offset);
+        }
+    }
+
+    fn next_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            self.current_search_match = None;
+            return;
+        }
+
+        let next = self
+            .current_search_match
+            .map(|index| (index + 1) % self.search_matches.len())
+            .unwrap_or(0);
+        self.select_search_match(next);
+    }
+
+    fn previous_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            self.current_search_match = None;
+            return;
+        }
+
+        let previous = self
+            .current_search_match
+            .map(|index| {
+                if index == 0 {
+                    self.search_matches.len() - 1
+                } else {
+                    index - 1
+                }
+            })
+            .unwrap_or(0);
+        self.select_search_match(previous);
+    }
+
+    fn search_status(&self) -> Option<String> {
+        if self.active_search_query.is_empty() {
+            return None;
+        }
+
+        if self.search_matches.is_empty() {
+            return Some("No matches".to_string());
+        }
+
+        let current = self.current_search_match.unwrap_or(0) + 1;
+        Some(format!("Match {current} of {}", self.search_matches.len()))
+    }
 }
 
 fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
     const BYTES_PER_ROW: usize = 16;
     const SELECTED_BYTE_BG: egui::Color32 = egui::Color32::from_rgb(255, 196, 0);
     const SELECTED_BYTE_FG: egui::Color32 = egui::Color32::from_rgb(24, 24, 24);
+    const SEARCH_BYTE_BG: egui::Color32 = egui::Color32::from_rgb(117, 180, 255);
+    const SEARCH_BYTE_FG: egui::Color32 = egui::Color32::from_rgb(16, 24, 32);
+    const ACTIVE_SEARCH_BYTE_BG: egui::Color32 = egui::Color32::from_rgb(105, 235, 165);
+    const ACTIVE_SEARCH_BYTE_FG: egui::Color32 = egui::Color32::from_rgb(8, 28, 18);
     let remaining = doc.size.saturating_sub(doc.hex_start_offset);
     let to_show = remaining.min(HEX_PAGE_SIZE as u64) as usize;
 
@@ -217,6 +319,13 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
         let visible_end = end.min(visible_end);
         (visible_start < visible_end).then_some((visible_start, visible_end))
     });
+    let visible_search_ranges = visible_search_ranges(
+        &doc.search_matches,
+        doc.current_search_match,
+        doc.active_search_query.len(),
+        doc.hex_start_offset,
+        visible_end,
+    );
 
     for row_start in (0..bytes.len()).step_by(BYTES_PER_ROW) {
         let row_end = (row_start + BYTES_PER_ROW).min(bytes.len());
@@ -243,12 +352,28 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
                     let is_selected = selected_visible_range.is_some_and(|(start, end)| {
                         absolute_offset >= start && absolute_offset < end
                     });
+                    let is_active_search =
+                        visible_search_ranges.iter().any(|(start, end, is_active)| {
+                            *is_active && absolute_offset >= *start && absolute_offset < *end
+                        });
+                    let is_search_match =
+                        visible_search_ranges.iter().any(|(start, end, is_active)| {
+                            !*is_active && absolute_offset >= *start && absolute_offset < *end
+                        });
 
                     let mut byte_text = egui::RichText::new(format!("{byte:02X}")).monospace();
-                    if is_selected {
+                    if is_active_search {
+                        byte_text = byte_text
+                            .background_color(ACTIVE_SEARCH_BYTE_BG)
+                            .color(ACTIVE_SEARCH_BYTE_FG);
+                    } else if is_selected {
                         byte_text = byte_text
                             .background_color(SELECTED_BYTE_BG)
                             .color(SELECTED_BYTE_FG);
+                    } else if is_search_match {
+                        byte_text = byte_text
+                            .background_color(SEARCH_BYTE_BG)
+                            .color(SEARCH_BYTE_FG);
                     }
                     ui.label(byte_text);
                 } else {
@@ -259,6 +384,82 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
             ui.monospace(ascii_column);
         });
     }
+}
+
+fn find_ascii_matches(
+    buffer: &dyn FileBuffer,
+    file_size: u64,
+    query: &[u8],
+) -> Result<Vec<u64>, String> {
+    if query.is_empty() || u64::try_from(query.len()).unwrap_or(u64::MAX) > file_size {
+        return Ok(Vec::new());
+    }
+
+    let overlap = query.len().saturating_sub(1);
+    let read_budget = SEARCH_CHUNK_SIZE
+        .checked_add(overlap)
+        .ok_or_else(|| "Search query is too large".to_string())?;
+    let mut matches = Vec::new();
+    let mut offset = 0_u64;
+
+    while offset < file_size {
+        let remaining = file_size.saturating_sub(offset);
+        let read_len = remaining.min(read_budget as u64) as usize;
+        let bytes = buffer
+            .read_bytes(offset, read_len)
+            .map_err(|err| err.to_string())?;
+
+        let is_last_chunk = offset.saturating_add(read_len as u64) >= file_size;
+        let scan_len = if is_last_chunk {
+            bytes.len()
+        } else {
+            bytes.len().saturating_sub(overlap)
+        };
+        let scan_end = scan_len.min(bytes.len().saturating_sub(query.len()).saturating_add(1));
+
+        for start in 0..scan_end {
+            if &bytes[start..start + query.len()] == query {
+                matches.push(offset + start as u64);
+            }
+        }
+
+        offset = offset.saturating_add(SEARCH_CHUNK_SIZE as u64);
+    }
+
+    Ok(matches)
+}
+
+fn visible_search_ranges(
+    matches: &[u64],
+    current_match: Option<usize>,
+    query_len: usize,
+    visible_start: u64,
+    visible_end: u64,
+) -> Vec<(u64, u64, bool)> {
+    if query_len == 0 {
+        return Vec::new();
+    }
+
+    let query_len = query_len as u64;
+    let mut ranges = Vec::new();
+
+    for (index, start) in matches.iter().copied().enumerate() {
+        let end = start.saturating_add(query_len);
+        if end <= visible_start {
+            continue;
+        }
+        if start >= visible_end {
+            break;
+        }
+
+        ranges.push((
+            start.max(visible_start),
+            end.min(visible_end),
+            current_match == Some(index),
+        ));
+    }
+
+    ranges
 }
 
 fn format_resolved_offset(offset: u64, offset_valid: bool) -> String {
@@ -525,6 +726,54 @@ impl eframe::App for BinOcularApp {
                         }
                     });
 
+                    ui.horizontal(|ui| {
+                        ui.label("Search");
+                        let _ = ui.text_edit_singleline(&mut doc.search_query);
+
+                        if ui.button("Find").clicked() {
+                            match doc.find_search_matches() {
+                                Ok(()) => {
+                                    if doc.last_error_is_offset {
+                                        doc.last_error = None;
+                                        doc.last_error_is_offset = false;
+                                    }
+                                }
+                                Err(err) => {
+                                    doc.last_error = Some(format!("Search failed: {err}"));
+                                    doc.last_error_is_offset = false;
+                                }
+                            }
+                        }
+
+                        let has_matches = !doc.search_matches.is_empty();
+                        if ui
+                            .add_enabled(has_matches, egui::Button::new("Prev"))
+                            .clicked()
+                        {
+                            doc.previous_search_match();
+                        }
+                        if ui
+                            .add_enabled(has_matches, egui::Button::new("Next"))
+                            .clicked()
+                        {
+                            doc.next_search_match();
+                        }
+
+                        let has_search_state = !doc.search_query.is_empty()
+                            || !doc.active_search_query.is_empty()
+                            || !doc.search_matches.is_empty();
+                        if ui
+                            .add_enabled(has_search_state, egui::Button::new("Clear"))
+                            .clicked()
+                        {
+                            doc.clear_search();
+                        }
+
+                        if let Some(status) = doc.search_status() {
+                            ui.label(status);
+                        }
+                    });
+
                     ui.separator();
                     if let (Some(name), Some((offset, len))) =
                         (doc.selected_field_name.as_deref(), doc.selected_field_range)
@@ -613,4 +862,116 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|_cc| Box::new(BinOcularApp::new())),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory_doc(bytes: &[u8]) -> Document {
+        Document {
+            _path: PathBuf::new(),
+            name: "test.bin".to_string(),
+            size: bytes.len() as u64,
+            buffer: Arc::new(MemoryBuffer::from_vec(bytes.to_vec())),
+            schema: None,
+            field_evaluations: None,
+            last_error: None,
+            last_error_is_offset: false,
+            schema_path: None,
+            hex_start_offset: 0,
+            hex_offset_input: "0x0".to_string(),
+            selected_field_range: None,
+            selected_field_name: None,
+            search_query: String::new(),
+            active_search_query: String::new(),
+            search_matches: Vec::new(),
+            current_search_match: None,
+        }
+    }
+
+    #[test]
+    fn ascii_search_finds_exact_matches() {
+        let buffer = MemoryBuffer::from_vec(b"abc BIN def BIN".to_vec());
+
+        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"BIN").unwrap();
+
+        assert_eq!(matches, vec![4, 12]);
+    }
+
+    #[test]
+    fn ascii_search_finds_overlapping_matches() {
+        let buffer = MemoryBuffer::from_vec(b"AAAA".to_vec());
+
+        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"AA").unwrap();
+
+        assert_eq!(matches, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn ascii_search_reports_no_matches() {
+        let buffer = MemoryBuffer::from_vec(b"BINOCULAR".to_vec());
+
+        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"HELLO").unwrap();
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn ascii_search_empty_query_is_empty() {
+        let buffer = MemoryBuffer::from_vec(b"BINOCULAR".to_vec());
+
+        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"").unwrap();
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn ascii_search_is_case_sensitive() {
+        let buffer = MemoryBuffer::from_vec(b"bin BIN".to_vec());
+
+        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"BIN").unwrap();
+
+        assert_eq!(matches, vec![4]);
+    }
+
+    #[test]
+    fn ascii_search_finds_match_crossing_chunk_boundary() {
+        let mut bytes = vec![b'.'; SEARCH_CHUNK_SIZE + 8];
+        bytes[SEARCH_CHUNK_SIZE - 2..SEARCH_CHUNK_SIZE + 3].copy_from_slice(b"HELLO");
+        let buffer = MemoryBuffer::from_vec(bytes);
+
+        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"HELLO").unwrap();
+
+        assert_eq!(matches, vec![(SEARCH_CHUNK_SIZE - 2) as u64]);
+    }
+
+    #[test]
+    fn document_find_replaces_previous_results() {
+        let mut doc = memory_doc(b"BIN HELLO BIN");
+        doc.search_query = "BIN".to_string();
+        doc.find_search_matches().unwrap();
+        assert_eq!(doc.search_matches, vec![0, 10]);
+        assert_eq!(doc.current_search_match, Some(0));
+
+        doc.search_query = "HELLO".to_string();
+        doc.find_search_matches().unwrap();
+
+        assert_eq!(doc.search_matches, vec![4]);
+        assert_eq!(doc.current_search_match, Some(0));
+        assert_eq!(doc.active_search_query, "HELLO");
+    }
+
+    #[test]
+    fn document_editing_query_does_not_rescan() {
+        let mut doc = memory_doc(b"BIN HELLO BIN");
+        doc.search_query = "BIN".to_string();
+        doc.find_search_matches().unwrap();
+
+        doc.search_query = "HELLO".to_string();
+
+        assert_eq!(doc.search_matches, vec![0, 10]);
+        assert_eq!(doc.active_search_query, "BIN");
+        assert_eq!(doc.search_status().as_deref(), Some("Match 1 of 2"));
+    }
 }
