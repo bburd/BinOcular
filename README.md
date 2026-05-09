@@ -28,6 +28,7 @@ Use it when you have a binary file, some knowledge of its structure, and want a 
 - File includes and fixed-count repeats
 - Dynamic lengths and offsets from earlier fields
 - Simple integer expressions (`add` / `sub`)
+- Reusable structures that expand to flat dotted field names
 
 ### Inspection
 
@@ -102,7 +103,7 @@ fields:
       value:
         op: add
         left: { field: "data_offset" }
-        right: { const: 4 }
+        right: { const: 3 }
     length: 3
 ```
 
@@ -112,6 +113,29 @@ Run the CLI:
 cargo run -p binocular-cli -- --schema packet.yml packet.bin
 ```
 
+Schemas can also define reusable structures and instantiate them at offsets:
+
+```yaml
+schema_name: "Structured Packet"
+schema_version: 1
+endianness: little
+structures:
+  - name: header
+    fields:
+      - name: magic
+        type: u16
+        offset: { kind: Relative, value: 0 }
+      - name: length
+        type: u16
+        offset: { kind: Relative, value: 2 }
+fields:
+  - name: header
+    struct: header
+    offset: { kind: Absolute, value: 0 }
+```
+
+This emits flat rows such as `header.magic` and `header.length`, so CLI and GUI output stay table-friendly.
+
 Example output:
 
 ```text
@@ -120,7 +144,7 @@ header_len | 0 (0x00000000)    | u16         | 12         | -
 data_offset| 2 (0x00000002)    | u32         | 16         | -
 payload_len| 6 (0x00000006)    | u16         | 7          | -
 payload    | 16 (0x00000010)   | bytes[3]    | 43 41 54   | -
-tag        | 20 (0x00000014)   | ascii[3]    | "END"      | -
+tag        | 19 (0x00000013)   | ascii[3]    | "END"      | -
 ```
 
 Run the GUI:
@@ -145,10 +169,11 @@ The GUI can:
 
 ## Current Capabilities
 
-As of v0.6.0, BinOcular supports:
+As of v0.7.0, BinOcular supports:
 
 - Dynamic schema-driven parsing
 - Repeat fields and schema includes
+- Reusable schema structures with flat output names
 - Runtime-computed lengths and offsets
 - Interactive GUI inspection with highlighting and search
 - Large-file mmap-backed inspection
@@ -159,7 +184,7 @@ BinOcular is currently read-only. It is a binary inspection tool, not a full hex
 
 Not currently supported:
 
-- Nested schemas
+- Nested struct instances
 - Conditional fields
 - Multiplication/division in expressions
 - Regex search
@@ -184,7 +209,7 @@ Users can verify a downloaded artifact by comparing its SHA256 hash against `SHA
 
 Planned areas of expansion include:
 
-- Nested/structured schemas
+- Nested struct instances
 - Richer expressions and conditionals
 - Additional search and navigation tools
 - Plugin system

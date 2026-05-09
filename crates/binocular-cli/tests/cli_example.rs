@@ -151,6 +151,73 @@ fields:
 }
 
 #[test]
+fn structured_schema_emits_flat_json_records_with_dotted_names(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema_path = unique_temp_path("structured_schema", "yaml");
+    let bin_path = unique_temp_path("structured_data", "bin");
+
+    let schema = r#"
+schema_name: "Structured"
+schema_version: 1
+endianness: little
+structures:
+  - name: header
+    fields:
+      - name: magic
+        type: u16
+        offset:
+          kind: Relative
+          value: 0
+      - name: length
+        type: u16
+        offset:
+          kind: Relative
+          value: 2
+fields:
+  - name: header
+    struct: header
+    offset:
+      kind: Absolute
+      value: 0
+"#;
+
+    fs::write(&schema_path, schema)?;
+    fs::write(&bin_path, [0xCD_u8, 0xAB, 4, 0])?;
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--schema",
+            schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    remove_if_exists(&schema_path);
+    remove_if_exists(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    assert_eq!(records.len(), 2);
+
+    assert_eq!(records[0].name, "header.magic");
+    assert_eq!(records[0].offset, Some(0));
+    assert_eq!(records[0].offset_hex.as_deref(), Some("0x00000000"));
+    assert_eq!(records[0].field_type.as_deref(), Some("u16"));
+    assert_eq!(records[0].value.as_u64(), Some(0xABCD));
+
+    assert_eq!(records[1].name, "header.length");
+    assert_eq!(records[1].offset, Some(2));
+    assert_eq!(records[1].offset_hex.as_deref(), Some("0x00000002"));
+    assert_eq!(records[1].field_type.as_deref(), Some("u16"));
+    assert_eq!(records[1].value.as_u64(), Some(4));
+
+    Ok(())
+}
+
+#[test]
 fn dynamic_offset_schema_outputs_resolved_runtime_offset() -> Result<(), Box<dyn std::error::Error>>
 {
     let schema_path = unique_temp_path("dynamic_offset_schema", "yaml");

@@ -386,6 +386,29 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
     }
 }
 
+fn responsive_text_edit_width(ui: &egui::Ui, preferred: f32, minimum: f32) -> f32 {
+    let available = ui.available_width();
+    available.min(preferred).max(minimum.min(available))
+}
+
+fn clicked_outside_regions(
+    ui: &egui::Ui,
+    panel_rect: egui::Rect,
+    protected_rects: &[egui::Rect],
+) -> bool {
+    let Some(click_pos) = ui.ctx().input(|input| {
+        input
+            .pointer
+            .primary_clicked()
+            .then(|| input.pointer.interact_pos())
+            .flatten()
+    }) else {
+        return false;
+    };
+
+    panel_rect.contains(click_pos) && !protected_rects.iter().any(|rect| rect.contains(click_pos))
+}
+
 fn find_ascii_matches(
     buffer: &dyn FileBuffer,
     file_size: u64,
@@ -526,8 +549,9 @@ fn draw_field_table(
     ui: &mut egui::Ui,
     evaluations: &[FieldEval],
     selected_range: Option<(u64, usize)>,
-) -> Option<(String, u64, usize)> {
+) -> (Option<(String, u64, usize)>, Vec<egui::Rect>) {
     let mut clicked_field = None;
+    let mut row_rects = Vec::new();
 
     egui::Grid::new("field_evaluations")
         .striped(true)
@@ -546,6 +570,7 @@ fn draw_field_table(
 
                 let response = ui.selectable_label(is_selected, &eval.display_name);
                 row_clicked |= response.clicked();
+                let mut row_rect = response.rect;
 
                 let response = ui.selectable_label(
                     is_selected,
@@ -556,17 +581,21 @@ fn draw_field_table(
                     .monospace(),
                 );
                 row_clicked |= response.clicked();
+                row_rect = row_rect.union(response.rect);
 
                 let response = ui.selectable_label(is_selected, format!("{:?}", eval.field.ty));
                 row_clicked |= response.clicked();
+                row_rect = row_rect.union(response.rect);
 
                 if let Some(value) = &eval.value {
                     let response =
                         ui.selectable_label(is_selected, format_value(value, eval.byte_len));
                     row_clicked |= response.clicked();
+                    row_rect = row_rect.union(response.rect);
                 } else {
                     let response = ui.selectable_label(is_selected, "-");
                     row_clicked |= response.clicked();
+                    row_rect = row_rect.union(response.rect);
                 }
 
                 if let Some(error) = &eval.error {
@@ -575,9 +604,11 @@ fn draw_field_table(
                         egui::RichText::new(error).color(ui.visuals().error_fg_color),
                     );
                     row_clicked |= response.clicked();
+                    row_rect = row_rect.union(response.rect);
                 } else {
                     let response = ui.selectable_label(is_selected, "-");
                     row_clicked |= response.clicked();
+                    row_rect = row_rect.union(response.rect);
                 }
 
                 if row_clicked && eval.offset_valid {
@@ -592,11 +623,13 @@ fn draw_field_table(
                     ));
                 }
 
+                row_rects.push(row_rect.expand2(egui::vec2(ui.spacing().item_spacing.x, 0.0)));
+
                 ui.end_row();
             }
         });
 
-    clicked_field
+    (clicked_field, row_rects)
 }
 
 impl eframe::App for BinOcularApp {
@@ -634,12 +667,15 @@ impl eframe::App for BinOcularApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(index) = self.current_doc {
                 if let Some(doc) = self.documents.get_mut(index) {
-                    ui.heading(&doc.name);
-                    ui.label(format!("Size: {}", format_size(doc.size)));
+                    let panel_rect = ui.max_rect();
+                    let mut protected_rects = Vec::new();
+
+                    protected_rects.push(ui.heading(&doc.name).rect);
+                    protected_rects.push(ui.label(format!("Size: {}", format_size(doc.size))).rect);
 
                     if let Some(error) = doc.last_error.as_deref() {
                         let error_text = error.to_owned();
-                        ui.horizontal(|ui| {
+                        let response = ui.horizontal_wrapped(|ui| {
                             ui.colored_label(
                                 ui.visuals().error_fg_color,
                                 egui::RichText::new(&error_text).strong(),
@@ -649,12 +685,17 @@ impl eframe::App for BinOcularApp {
                                 doc.last_error_is_offset = false;
                             }
                         });
+                        protected_rects.push(response.response.rect);
                         ui.add_space(4.0);
                     }
 
-                    ui.horizontal(|ui| {
+                    let offset_controls = ui.horizontal_wrapped(|ui| {
                         ui.label("Go to offset:");
-                        let _ = ui.text_edit_singleline(&mut doc.hex_offset_input);
+                        let width = responsive_text_edit_width(ui, 160.0, 72.0);
+                        let _ = ui.add_sized(
+                            [width, ui.spacing().interact_size.y],
+                            egui::TextEdit::singleline(&mut doc.hex_offset_input),
+                        );
 
                         if ui.button("Go").clicked() {
                             let input = doc.hex_offset_input.trim();
@@ -725,10 +766,15 @@ impl eframe::App for BinOcularApp {
                             }
                         }
                     });
+                    protected_rects.push(offset_controls.response.rect);
 
-                    ui.horizontal(|ui| {
+                    let search_controls = ui.horizontal_wrapped(|ui| {
                         ui.label("Search");
-                        let _ = ui.text_edit_singleline(&mut doc.search_query);
+                        let width = responsive_text_edit_width(ui, 240.0, 96.0);
+                        let _ = ui.add_sized(
+                            [width, ui.spacing().interact_size.y],
+                            egui::TextEdit::singleline(&mut doc.search_query),
+                        );
 
                         if ui.button("Find").clicked() {
                             match doc.find_search_matches() {
@@ -773,22 +819,29 @@ impl eframe::App for BinOcularApp {
                             ui.label(status);
                         }
                     });
+                    protected_rects.push(search_controls.response.rect);
 
                     ui.separator();
                     if let (Some(name), Some((offset, len))) =
                         (doc.selected_field_name.as_deref(), doc.selected_field_range)
                     {
-                        ui.label(format!("Selected: {name} @ 0x{offset:08X} (len {len})"));
+                        protected_rects.push(
+                            ui.label(format!("Selected: {name} @ 0x{offset:08X} (len {len})"))
+                                .rect,
+                        );
                     }
-                    egui::ScrollArea::vertical()
+                    let hex_output = egui::ScrollArea::both()
+                        .id_source("hex_view_scroll_area")
                         .max_height(HEX_VIEW_HEIGHT)
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             draw_hex_view(ui, doc);
                         });
+                    protected_rects.push(hex_output.inner_rect.expand(4.0));
 
                     if doc.schema.is_some() {
                         ui.separator();
-                        ui.heading("Interpreted Fields");
+                        protected_rects.push(ui.heading("Interpreted Fields").rect);
 
                         if let Some(schema) = doc.schema.as_ref() {
                             let mut schema_label = format!(
@@ -803,19 +856,30 @@ impl eframe::App for BinOcularApp {
                                 }
                             }
 
-                            ui.label(schema_label);
+                            protected_rects.push(ui.label(schema_label).rect);
                         }
 
                         if let Some(evaluations) = doc.field_evaluations.as_ref() {
                             if !evaluations.is_empty() {
-                                if let Some((name, offset, byte_len)) =
-                                    draw_field_table(ui, evaluations, doc.selected_field_range)
-                                {
+                                let table_output = egui::ScrollArea::horizontal()
+                                    .id_source("field_table_scroll_area")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        draw_field_table(ui, evaluations, doc.selected_field_range)
+                                    });
+                                protected_rects.extend(table_output.inner.1);
+
+                                if let Some((name, offset, byte_len)) = table_output.inner.0 {
                                     doc.select_field(name, offset, byte_len);
                                 }
                             }
                         }
                     }
+
+                    if clicked_outside_regions(ui, panel_rect, &protected_rects) {
+                        doc.clear_selected_field();
+                    }
+
                     return;
                 }
             }

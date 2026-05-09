@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use crate::buffer::FileBuffer;
 use crate::error::InterpretError;
 use binocular_schema::ast::{
-    Endianness, FieldDef, FieldType, IntExpr, LengthSpec, OffsetKind, Schema,
+    Endianness, FieldDef, FieldItem, FieldType, IntExpr, LengthSpec, OffsetKind, Schema,
+    StructInstanceDef, StructureDef,
 };
 
 #[derive(Debug, Clone)]
@@ -101,77 +102,303 @@ pub fn interpret_schema<B: FileBuffer + ?Sized>(buffer: &B, schema: &Schema) -> 
     let mut rows = Vec::new();
     let mut context = FieldContext::new();
 
-    for field in &schema.fields {
-        let count = field.repeat.as_ref().map_or(1, |repeat| repeat.count);
-
-        for index in 0..count {
-            let display_name = if field.repeat.is_some() {
-                format!("{}[{index}]", field.name)
-            } else {
-                field.name.clone()
-            };
-
-            let resolved = resolve_repeated_offset(field, index, &context);
-            let resolved_offset = match resolved {
-                Ok(offset) => offset,
-                Err(err) => {
-                    rows.push(FieldEval {
-                        field: field.clone(),
-                        display_name,
-                        resolved_offset: 0,
-                        offset_valid: false,
-                        byte_len: 0,
-                        value: None,
-                        error: Some(err.to_string()),
-                    });
-                    continue;
-                }
-            };
-
-            let byte_len = match resolve_field_byte_len(field, &context) {
-                Ok(byte_len) => byte_len,
-                Err(err) => {
-                    rows.push(FieldEval {
-                        field: field.clone(),
-                        display_name,
-                        resolved_offset,
-                        offset_valid: true,
-                        byte_len: 0,
-                        value: None,
-                        error: Some(err.to_string()),
-                    });
-                    continue;
-                }
-            };
-
-            let value = interpret_field_at(buffer, field, Some(schema), resolved_offset, byte_len);
-            match value {
-                Ok(value) => {
-                    record_context_value(&mut context, &display_name, &value);
-                    rows.push(FieldEval {
-                        field: field.clone(),
-                        display_name,
-                        resolved_offset,
-                        offset_valid: true,
-                        byte_len,
-                        value: Some(value),
-                        error: None,
-                    })
-                }
-                Err(err) => rows.push(FieldEval {
-                    field: field.clone(),
-                    display_name,
-                    resolved_offset,
-                    offset_valid: true,
-                    byte_len,
-                    value: None,
-                    error: Some(err.to_string()),
-                }),
+    for item in &schema.fields {
+        match item {
+            FieldItem::Field(field) => {
+                interpret_scalar_repeats(buffer, schema, field, &mut context, &mut rows);
+            }
+            FieldItem::StructInstance(instance) => {
+                interpret_struct_instance(buffer, schema, instance, &mut context, &mut rows);
             }
         }
     }
 
     rows
+}
+
+fn interpret_scalar_repeats<B: FileBuffer + ?Sized>(
+    buffer: &B,
+    schema: &Schema,
+    field: &FieldDef,
+    context: &mut FieldContext,
+    rows: &mut Vec<FieldEval>,
+) {
+    let count = field.repeat.as_ref().map_or(1, |repeat| repeat.count);
+
+    for index in 0..count {
+        let display_name = if field.repeat.is_some() {
+            format!("{}[{index}]", field.name)
+        } else {
+            field.name.clone()
+        };
+
+        let resolved = resolve_repeated_offset(field, index, context);
+        let resolved_offset = match resolved {
+            Ok(offset) => offset,
+            Err(err) => {
+                push_error_row(rows, field, display_name, 0, false, 0, err);
+                continue;
+            }
+        };
+
+        interpret_scalar_at(
+            buffer,
+            schema,
+            field,
+            display_name,
+            resolved_offset,
+            context,
+            rows,
+        );
+    }
+}
+
+fn interpret_struct_instance<B: FileBuffer + ?Sized>(
+    buffer: &B,
+    schema: &Schema,
+    instance: &StructInstanceDef,
+    context: &mut FieldContext,
+    rows: &mut Vec<FieldEval>,
+) {
+    let Some(structure) = find_structure(schema, &instance.struct_name) else {
+        push_struct_instance_error_rows(
+            rows,
+            instance,
+            None,
+            None,
+            InterpretError::UnknownStructure {
+                name: instance.struct_name.clone(),
+            },
+        );
+        return;
+    };
+
+    let count = instance.repeat.as_ref().map_or(1, |repeat| repeat.count);
+    let stride = match instance.repeat.as_ref().and_then(|repeat| repeat.stride) {
+        Some(stride) => Some(stride),
+        None if instance.repeat.is_some() => {
+            push_struct_instance_error_rows(
+                rows,
+                instance,
+                Some(structure),
+                None,
+                InterpretError::MissingStructStride {
+                    name: instance.name.clone(),
+                },
+            );
+            return;
+        }
+        None => None,
+    };
+
+    for index in 0..count {
+        let parent_base = match resolve_struct_instance_offset(instance, index, stride, context) {
+            Ok(offset) => offset,
+            Err(err) => {
+                let display_index = instance.repeat.as_ref().map(|_| index);
+                push_struct_instance_error_rows(
+                    rows,
+                    instance,
+                    Some(structure),
+                    display_index,
+                    err,
+                );
+                continue;
+            }
+        };
+
+        for child in &structure.fields {
+            let child_count = child.repeat.as_ref().map_or(1, |repeat| repeat.count);
+
+            for child_index in 0..child_count {
+                let display_name = struct_child_display_name(instance, child, index, child_index);
+                let resolved_offset =
+                    match resolve_struct_child_offset(parent_base, child, child_index) {
+                        Ok(offset) => offset,
+                        Err(err) => {
+                            push_error_row(rows, child, display_name, 0, false, 0, err);
+                            continue;
+                        }
+                    };
+
+                interpret_scalar_at(
+                    buffer,
+                    schema,
+                    child,
+                    display_name,
+                    resolved_offset,
+                    context,
+                    rows,
+                );
+            }
+        }
+    }
+}
+
+fn interpret_scalar_at<B: FileBuffer + ?Sized>(
+    buffer: &B,
+    schema: &Schema,
+    field: &FieldDef,
+    display_name: String,
+    resolved_offset: u64,
+    context: &mut FieldContext,
+    rows: &mut Vec<FieldEval>,
+) {
+    let byte_len = match resolve_field_byte_len(field, context) {
+        Ok(byte_len) => byte_len,
+        Err(err) => {
+            push_error_row(rows, field, display_name, resolved_offset, true, 0, err);
+            return;
+        }
+    };
+
+    let value = interpret_field_at(buffer, field, Some(schema), resolved_offset, byte_len);
+    match value {
+        Ok(value) => {
+            record_context_value(context, &display_name, &value);
+            rows.push(FieldEval {
+                field: field.clone(),
+                display_name,
+                resolved_offset,
+                offset_valid: true,
+                byte_len,
+                value: Some(value),
+                error: None,
+            })
+        }
+        Err(err) => push_error_row(
+            rows,
+            field,
+            display_name,
+            resolved_offset,
+            true,
+            byte_len,
+            err,
+        ),
+    }
+}
+
+fn push_error_row(
+    rows: &mut Vec<FieldEval>,
+    field: &FieldDef,
+    display_name: String,
+    resolved_offset: u64,
+    offset_valid: bool,
+    byte_len: usize,
+    err: InterpretError,
+) {
+    rows.push(FieldEval {
+        field: field.clone(),
+        display_name,
+        resolved_offset,
+        offset_valid,
+        byte_len,
+        value: None,
+        error: Some(err.to_string()),
+    });
+}
+
+fn push_struct_instance_error_rows(
+    rows: &mut Vec<FieldEval>,
+    instance: &StructInstanceDef,
+    structure: Option<&StructureDef>,
+    index: Option<u64>,
+    err: InterpretError,
+) {
+    let Some(structure) = structure else {
+        return;
+    };
+
+    for child in &structure.fields {
+        rows.push(FieldEval {
+            field: child.clone(),
+            display_name: match index {
+                Some(index) => format!("{}[{index}].{}", instance.name, child.name),
+                None => format!("{}.{}", instance.name, child.name),
+            },
+            resolved_offset: 0,
+            offset_valid: false,
+            byte_len: 0,
+            value: None,
+            error: Some(err.to_string()),
+        });
+    }
+}
+
+fn find_structure<'a>(schema: &'a Schema, name: &str) -> Option<&'a StructureDef> {
+    schema
+        .structures
+        .iter()
+        .find(|structure| structure.name == name)
+}
+
+fn struct_child_display_name(
+    instance: &StructInstanceDef,
+    child: &FieldDef,
+    instance_index: u64,
+    child_index: u64,
+) -> String {
+    let child_name = if child.repeat.is_some() {
+        format!("{}[{child_index}]", child.name)
+    } else {
+        child.name.clone()
+    };
+
+    if instance.repeat.is_some() {
+        format!("{}[{instance_index}].{child_name}", instance.name)
+    } else {
+        format!("{}.{}", instance.name, child_name)
+    }
+}
+
+fn resolve_struct_instance_offset(
+    instance: &StructInstanceDef,
+    index: u64,
+    stride: Option<u64>,
+    context: &FieldContext,
+) -> Result<u64, InterpretError> {
+    let base_offset = resolve_offset_kind(&instance.offset, context)?;
+    if index == 0 {
+        return Ok(base_offset);
+    }
+
+    let stride = stride.ok_or_else(|| InterpretError::MissingStructStride {
+        name: instance.name.clone(),
+    })?;
+    let repeated_bytes = index
+        .checked_mul(stride)
+        .ok_or(InterpretError::OffsetOverflow)?;
+
+    base_offset
+        .checked_add(repeated_bytes)
+        .ok_or(InterpretError::OffsetOverflow)
+}
+
+fn resolve_struct_child_offset(
+    parent_base: u64,
+    child: &FieldDef,
+    child_index: u64,
+) -> Result<u64, InterpretError> {
+    let child_base = match &child.offset {
+        OffsetKind::Relative(relative) => parent_base
+            .checked_add(*relative)
+            .ok_or(InterpretError::OffsetOverflow),
+        _ => Err(InterpretError::RelativeOffsetWithoutBase),
+    }?;
+
+    if child_index == 0 {
+        return Ok(child_base);
+    }
+
+    let stride =
+        u64::try_from(fixed_field_byte_len(child)?).map_err(|_| InterpretError::OffsetOverflow)?;
+    let repeated_bytes = child_index
+        .checked_mul(stride)
+        .ok_or(InterpretError::OffsetOverflow)?;
+
+    child_base
+        .checked_add(repeated_bytes)
+        .ok_or(InterpretError::OffsetOverflow)
 }
 
 fn fixed_field_byte_len(field: &FieldDef) -> Result<usize, InterpretError> {
@@ -195,8 +422,13 @@ fn fixed_field_byte_len(field: &FieldDef) -> Result<usize, InterpretError> {
 }
 
 fn resolve_base_offset(field: &FieldDef, context: &FieldContext) -> Result<u64, InterpretError> {
-    match &field.offset {
+    resolve_offset_kind(&field.offset, context)
+}
+
+fn resolve_offset_kind(offset: &OffsetKind, context: &FieldContext) -> Result<u64, InterpretError> {
+    match offset {
         OffsetKind::Absolute(offset) => Ok(*offset),
+        OffsetKind::Relative(_) => Err(InterpretError::RelativeOffsetWithoutBase),
         OffsetKind::FieldRef(referenced) => resolve_dynamic_offset(referenced, context),
         OffsetKind::Expr(expr) => resolve_offset_expr(expr, context),
     }
@@ -449,8 +681,15 @@ mod tests {
     use super::*;
     use crate::buffer::MemoryBuffer;
     use binocular_schema::ast::{
-        Endianness, FieldDef, FieldType, IntExpr, IntExprOp, LengthSpec, OffsetKind, Schema,
+        Endianness, FieldDef, FieldItem, FieldType, IntExpr, IntExprOp, LengthSpec, OffsetKind,
+        Schema, StructInstanceDef, StructureDef,
     };
+
+    macro_rules! fields {
+        ($($field:expr),* $(,)?) => {
+            vec![$(FieldItem::Field($field)),*]
+        };
+    }
 
     fn make_field(
         name: &str,
@@ -536,7 +775,8 @@ mod tests {
             schema_name: "mixed".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("byte", FieldType::U8, 0, None),
                 make_field("u32_fail", FieldType::U32, 1, None),
             ],
@@ -581,7 +821,8 @@ mod tests {
             schema_name: "test".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Big),
-            fields: vec![],
+            structures: vec![],
+            fields: fields![],
         };
 
         let u8_value = interpret_field(
@@ -700,7 +941,8 @@ mod tests {
             schema_name: "precedence".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Big),
-            fields: vec![],
+            structures: vec![],
+            fields: fields![],
         };
 
         let field = make_field("u16", FieldType::U16, 0, Some(Endianness::Little));
@@ -786,14 +1028,18 @@ mod tests {
             schema_name: "repeat".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![FieldDef {
+            structures: vec![],
+            fields: fields![FieldDef {
                 name: "byte".to_string(),
                 ty: FieldType::U8,
                 offset: OffsetKind::Absolute(0),
                 length: None,
                 endianness: None,
                 description: None,
-                repeat: Some(binocular_schema::ast::RepeatInfo { count: 3 }),
+                repeat: Some(binocular_schema::ast::RepeatInfo {
+                    count: 3,
+                    stride: None
+                }),
             }],
         };
 
@@ -826,14 +1072,18 @@ mod tests {
             schema_name: "repeat".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![FieldDef {
+            structures: vec![],
+            fields: fields![FieldDef {
                 name: "chunk".to_string(),
                 ty: FieldType::Ascii,
                 offset: OffsetKind::Absolute(0),
                 length: Some(LengthSpec::Literal(4)),
                 endianness: None,
                 description: None,
-                repeat: Some(binocular_schema::ast::RepeatInfo { count: 2 }),
+                repeat: Some(binocular_schema::ast::RepeatInfo {
+                    count: 2,
+                    stride: None
+                }),
             }],
         };
 
@@ -863,14 +1113,18 @@ mod tests {
             schema_name: "repeat".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![FieldDef {
+            structures: vec![],
+            fields: fields![FieldDef {
                 name: "pair".to_string(),
                 ty: FieldType::U8,
                 offset: OffsetKind::Absolute(1),
                 length: None,
                 endianness: None,
                 description: None,
-                repeat: Some(binocular_schema::ast::RepeatInfo { count: 3 }),
+                repeat: Some(binocular_schema::ast::RepeatInfo {
+                    count: 3,
+                    stride: None
+                }),
             }],
         };
 
@@ -902,14 +1156,18 @@ mod tests {
             schema_name: "repeat".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![FieldDef {
+            structures: vec![],
+            fields: fields![FieldDef {
                 name: "overflow".to_string(),
                 ty: FieldType::U16,
                 offset: OffsetKind::Absolute(u64::MAX - 1),
                 length: None,
                 endianness: None,
                 description: None,
-                repeat: Some(binocular_schema::ast::RepeatInfo { count: 2 }),
+                repeat: Some(binocular_schema::ast::RepeatInfo {
+                    count: 2,
+                    stride: None
+                }),
             }],
         };
 
@@ -937,13 +1195,283 @@ mod tests {
     }
 
     #[test]
+    fn struct_instance_expands_children_into_flat_rows() {
+        let buffer = MemoryBuffer::from_vec(vec![0xCD, 0xAB, 0x04, 0x00]);
+        let schema = Schema {
+            schema_name: "structured".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            structures: vec![StructureDef {
+                name: "header".to_string(),
+                fields: vec![
+                    FieldDef {
+                        name: "magic".to_string(),
+                        ty: FieldType::U16,
+                        offset: OffsetKind::Relative(0),
+                        length: None,
+                        endianness: None,
+                        description: None,
+                        repeat: None,
+                    },
+                    FieldDef {
+                        name: "length".to_string(),
+                        ty: FieldType::U16,
+                        offset: OffsetKind::Relative(2),
+                        length: None,
+                        endianness: None,
+                        description: None,
+                        repeat: None,
+                    },
+                ],
+            }],
+            fields: vec![FieldItem::StructInstance(StructInstanceDef {
+                name: "header".to_string(),
+                struct_name: "header".to_string(),
+                offset: OffsetKind::Absolute(0),
+                description: None,
+                repeat: None,
+            })],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].display_name, "header.magic");
+        assert_eq!(results[0].resolved_offset, 0);
+        assert_uint(results[0].value.clone().unwrap(), 0xABCD);
+        assert_eq!(results[1].display_name, "header.length");
+        assert_eq!(results[1].resolved_offset, 2);
+        assert_uint(results[1].value.clone().unwrap(), 4);
+    }
+
+    #[test]
+    fn repeated_struct_instance_uses_explicit_stride() {
+        let buffer = MemoryBuffer::from_vec(vec![1, 0, 0xAA, 0xAA, 2, 0, 0xBB, 0xBB]);
+        let schema = Schema {
+            schema_name: "records".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            structures: vec![StructureDef {
+                name: "record".to_string(),
+                fields: vec![FieldDef {
+                    name: "id".to_string(),
+                    ty: FieldType::U16,
+                    offset: OffsetKind::Relative(0),
+                    length: None,
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                }],
+            }],
+            fields: vec![FieldItem::StructInstance(StructInstanceDef {
+                name: "records".to_string(),
+                struct_name: "record".to_string(),
+                offset: OffsetKind::Absolute(0),
+                description: None,
+                repeat: Some(binocular_schema::ast::RepeatInfo {
+                    count: 2,
+                    stride: Some(4),
+                }),
+            })],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].display_name, "records[0].id");
+        assert_eq!(results[0].resolved_offset, 0);
+        assert_uint(results[0].value.clone().unwrap(), 1);
+        assert_eq!(results[1].display_name, "records[1].id");
+        assert_eq!(results[1].resolved_offset, 4);
+        assert_uint(results[1].value.clone().unwrap(), 2);
+    }
+
+    #[test]
+    fn struct_child_offsets_are_relative_to_parent_base() {
+        let buffer = MemoryBuffer::from_vec(vec![0x00, 0x00, 0x34, 0x12]);
+        let schema = Schema {
+            schema_name: "relative".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            structures: vec![StructureDef {
+                name: "header".to_string(),
+                fields: vec![FieldDef {
+                    name: "value".to_string(),
+                    ty: FieldType::U16,
+                    offset: OffsetKind::Relative(1),
+                    length: None,
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                }],
+            }],
+            fields: vec![FieldItem::StructInstance(StructInstanceDef {
+                name: "header".to_string(),
+                struct_name: "header".to_string(),
+                offset: OffsetKind::Absolute(1),
+                description: None,
+                repeat: None,
+            })],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+
+        assert_eq!(results[0].display_name, "header.value");
+        assert_eq!(results[0].resolved_offset, 2);
+        assert_uint(results[0].value.clone().unwrap(), 0x1234);
+    }
+
+    #[test]
+    fn struct_child_failure_stays_row_local() {
+        let buffer = MemoryBuffer::from_vec(vec![0xAA, 0xBB]);
+        let schema = Schema {
+            schema_name: "row_error".to_string(),
+            schema_version: 1,
+            endianness: None,
+            structures: vec![StructureDef {
+                name: "header".to_string(),
+                fields: vec![
+                    FieldDef {
+                        name: "byte".to_string(),
+                        ty: FieldType::U8,
+                        offset: OffsetKind::Relative(0),
+                        length: None,
+                        endianness: None,
+                        description: None,
+                        repeat: None,
+                    },
+                    FieldDef {
+                        name: "too_wide".to_string(),
+                        ty: FieldType::U32,
+                        offset: OffsetKind::Relative(1),
+                        length: None,
+                        endianness: None,
+                        description: None,
+                        repeat: None,
+                    },
+                ],
+            }],
+            fields: vec![FieldItem::StructInstance(StructInstanceDef {
+                name: "header".to_string(),
+                struct_name: "header".to_string(),
+                offset: OffsetKind::Absolute(0),
+                description: None,
+                repeat: None,
+            })],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].error.is_none());
+        assert_uint(results[0].value.clone().unwrap(), 0xAA);
+        assert!(results[1].value.is_none());
+        assert!(results[1]
+            .error
+            .as_ref()
+            .expect("expected error")
+            .contains("buffer error"));
+    }
+
+    #[test]
+    fn struct_parent_offset_failure_marks_child_rows_invalid() {
+        let schema = Schema {
+            schema_name: "parent_offset_error".to_string(),
+            schema_version: 1,
+            endianness: None,
+            structures: vec![StructureDef {
+                name: "header".to_string(),
+                fields: vec![FieldDef {
+                    name: "magic".to_string(),
+                    ty: FieldType::U16,
+                    offset: OffsetKind::Relative(0),
+                    length: None,
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                }],
+            }],
+            fields: vec![FieldItem::StructInstance(StructInstanceDef {
+                name: "header".to_string(),
+                struct_name: "header".to_string(),
+                offset: OffsetKind::FieldRef("missing_offset".to_string()),
+                description: None,
+                repeat: None,
+            })],
+        };
+
+        let results = interpret_schema(&MemoryBuffer::from_vec(vec![0xAA, 0xBB]), &schema);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].display_name, "header.magic");
+        assert_eq!(results[0].resolved_offset, 0);
+        assert!(!results[0].offset_valid);
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some("missing dynamic offset reference `missing_offset`")
+        );
+    }
+
+    #[test]
+    fn struct_child_dynamic_length_uses_fully_qualified_prior_name() {
+        let buffer = MemoryBuffer::from_vec(vec![3, 0, b'C', b'A', b'T']);
+        let schema = Schema {
+            schema_name: "qualified_ref".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            structures: vec![StructureDef {
+                name: "packet".to_string(),
+                fields: vec![
+                    FieldDef {
+                        name: "length".to_string(),
+                        ty: FieldType::U16,
+                        offset: OffsetKind::Relative(0),
+                        length: None,
+                        endianness: None,
+                        description: None,
+                        repeat: None,
+                    },
+                    FieldDef {
+                        name: "payload".to_string(),
+                        ty: FieldType::Ascii,
+                        offset: OffsetKind::Relative(2),
+                        length: Some(LengthSpec::FieldRef {
+                            field: "packet.length".to_string(),
+                        }),
+                        endianness: None,
+                        description: None,
+                        repeat: None,
+                    },
+                ],
+            }],
+            fields: vec![FieldItem::StructInstance(StructInstanceDef {
+                name: "packet".to_string(),
+                struct_name: "packet".to_string(),
+                offset: OffsetKind::Absolute(0),
+                description: None,
+                repeat: None,
+            })],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+
+        assert_eq!(results[1].display_name, "packet.payload");
+        assert_eq!(results[1].byte_len, 3);
+        match results[1].value.as_ref().unwrap() {
+            FieldValue::Ascii(value) => assert_eq!(value, "CAT"),
+            other => panic!("expected Ascii, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn dynamic_length_resolves_from_prior_unsigned_field() {
         let buffer = MemoryBuffer::from_vec(vec![3, 0, b'C', b'A', b'T']);
         let schema = Schema {
             schema_name: "dynamic".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("block_len", FieldType::U16, 0, None),
                 make_sized_field(
                     "payload",
@@ -972,7 +1500,8 @@ mod tests {
             schema_name: "dynamic_i32".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("block_len", FieldType::I32, 0, None),
                 make_sized_field(
                     "payload",
@@ -1000,7 +1529,8 @@ mod tests {
             schema_name: "expr_length".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("block_len", FieldType::U16, 0, None),
                 make_sized_field(
                     "payload",
@@ -1028,7 +1558,8 @@ mod tests {
             schema_name: "dynamic_repeat_source".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 FieldDef {
                     name: "sizes".to_string(),
                     ty: FieldType::U16,
@@ -1036,7 +1567,10 @@ mod tests {
                     length: None,
                     endianness: None,
                     description: None,
-                    repeat: Some(binocular_schema::ast::RepeatInfo { count: 2 }),
+                    repeat: Some(binocular_schema::ast::RepeatInfo {
+                        count: 2,
+                        stride: None
+                    }),
                 },
                 make_sized_field(
                     "payload",
@@ -1064,7 +1598,8 @@ mod tests {
             schema_name: "missing_ref".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![make_sized_field(
+            structures: vec![],
+            fields: fields![make_sized_field(
                 "payload",
                 FieldType::Ascii,
                 0,
@@ -1090,7 +1625,8 @@ mod tests {
             schema_name: "missing_expr_ref".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![make_sized_field(
+            structures: vec![],
+            fields: fields![make_sized_field(
                 "payload",
                 FieldType::Ascii,
                 0,
@@ -1114,7 +1650,8 @@ mod tests {
             schema_name: "non_numeric_ref".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
                 make_sized_field(
                     "payload",
@@ -1141,7 +1678,8 @@ mod tests {
             schema_name: "expr_non_numeric_ref".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
                 make_sized_field(
                     "payload",
@@ -1168,7 +1706,8 @@ mod tests {
             schema_name: "float_ref".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("len", FieldType::F32, 0, None),
                 make_sized_field(
                     "payload",
@@ -1195,7 +1734,8 @@ mod tests {
             schema_name: "negative_ref".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("len", FieldType::I32, 0, None),
                 make_sized_field(
                     "payload",
@@ -1222,7 +1762,8 @@ mod tests {
             schema_name: "expr_negative_length".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("len", FieldType::U16, 0, None),
                 make_sized_field(
                     "payload",
@@ -1249,7 +1790,8 @@ mod tests {
             schema_name: "expr_zero_length".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("len", FieldType::U16, 0, None),
                 make_sized_field(
                     "payload",
@@ -1275,7 +1817,8 @@ mod tests {
             schema_name: "expr_overflow".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![make_sized_field(
+            structures: vec![],
+            fields: fields![make_sized_field(
                 "payload",
                 FieldType::Ascii,
                 0,
@@ -1299,7 +1842,8 @@ mod tests {
             schema_name: "continue_after_error".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
                 make_sized_field(
                     "payload",
@@ -1328,7 +1872,8 @@ mod tests {
             schema_name: "continue_after_expr_error".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("len", FieldType::U16, 0, None),
                 make_sized_field(
                     "payload",
@@ -1357,7 +1902,8 @@ mod tests {
             schema_name: "dynamic_offset".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("data_offset", FieldType::U32, 0, None),
                 FieldDef {
                     name: "payload".to_string(),
@@ -1386,7 +1932,8 @@ mod tests {
             schema_name: "dynamic_offset_i32".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("data_offset", FieldType::I32, 0, None),
                 FieldDef {
                     name: "payload".to_string(),
@@ -1415,7 +1962,8 @@ mod tests {
             schema_name: "expr_offset".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("data_offset", FieldType::U32, 0, None),
                 FieldDef {
                     name: "payload".to_string(),
@@ -1444,7 +1992,8 @@ mod tests {
             schema_name: "missing_offset_ref".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![FieldDef {
+            structures: vec![],
+            fields: fields![FieldDef {
                 name: "payload".to_string(),
                 ty: FieldType::Ascii,
                 offset: OffsetKind::FieldRef("missing".to_string()),
@@ -1473,7 +2022,8 @@ mod tests {
             schema_name: "missing_expr_offset_ref".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![FieldDef {
+            structures: vec![],
+            fields: fields![FieldDef {
                 name: "payload".to_string(),
                 ty: FieldType::Ascii,
                 offset: OffsetKind::Expr(expr_add(expr_field("missing"), expr_const(1))),
@@ -1500,7 +2050,8 @@ mod tests {
             schema_name: "non_numeric_offset_ref".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
                 FieldDef {
                     name: "payload".to_string(),
@@ -1529,7 +2080,8 @@ mod tests {
             schema_name: "expr_non_numeric_offset_ref".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
                 FieldDef {
                     name: "payload".to_string(),
@@ -1558,7 +2110,8 @@ mod tests {
             schema_name: "negative_offset_ref".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("data_offset", FieldType::I32, 0, None),
                 FieldDef {
                     name: "payload".to_string(),
@@ -1587,7 +2140,8 @@ mod tests {
             schema_name: "negative_expr_offset".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("data_offset", FieldType::I32, 0, None),
                 FieldDef {
                     name: "payload".to_string(),
@@ -1615,7 +2169,8 @@ mod tests {
             schema_name: "expr_offset_overflow".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![FieldDef {
+            structures: vec![],
+            fields: fields![FieldDef {
                 name: "payload".to_string(),
                 ty: FieldType::Ascii,
                 offset: OffsetKind::Expr(expr_add(expr_const(i64::MAX), expr_const(1))),
@@ -1641,7 +2196,8 @@ mod tests {
             schema_name: "continue_after_offset_error".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
                 FieldDef {
                     name: "payload".to_string(),
@@ -1672,7 +2228,8 @@ mod tests {
             schema_name: "continue_after_expr_offset_error".to_string(),
             schema_version: 1,
             endianness: Some(Endianness::Little),
-            fields: vec![
+            structures: vec![],
+            fields: fields![
                 make_field("offset_base", FieldType::U16, 0, None),
                 FieldDef {
                     name: "payload".to_string(),
@@ -1703,7 +2260,8 @@ mod tests {
             schema_name: "offset_zero".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![FieldDef {
+            structures: vec![],
+            fields: fields![FieldDef {
                 name: "payload".to_string(),
                 ty: FieldType::Ascii,
                 offset: OffsetKind::Absolute(0),
@@ -1727,7 +2285,8 @@ mod tests {
             schema_name: "resolved_offset_buffer_error".to_string(),
             schema_version: 1,
             endianness: None,
-            fields: vec![FieldDef {
+            structures: vec![],
+            fields: fields![FieldDef {
                 name: "payload".to_string(),
                 ty: FieldType::U16,
                 offset: OffsetKind::Absolute(0),

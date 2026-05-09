@@ -1,0 +1,27 @@
+schema_name: "Structured Example"
+schema_version: 1
+endianness: little
+structures:
+  - name: header
+    fields:
+      - name: magic
+        type: u16
+        offset:
+          kind: Relative
+          value: 0
+      - name: length
+        type: u16
+        offset:
+          kind: Relative
+          value: 2
+fields:
+  - name: header
+    struct: header
+    offset:
+      kind: Absolute
+      value: 0
+  - name: answer
+    type: i32
+    offset:
+      kind: Absolute
+      value: 4

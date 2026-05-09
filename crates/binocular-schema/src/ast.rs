@@ -5,7 +5,9 @@ pub struct Schema {
     pub schema_name: String,
     pub schema_version: u32,
     pub endianness: Option<Endianness>,
-    pub fields: Vec<FieldDef>,
+    #[serde(default)]
+    pub structures: Vec<StructureDef>,
+    pub fields: Vec<FieldItem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +45,7 @@ pub enum IntExpr {
 #[serde(tag = "kind", content = "value")]
 pub enum OffsetKind {
     Absolute(u64),
+    Relative(u64),
     FieldRef(String),
     Expr(IntExpr),
 }
@@ -71,6 +74,8 @@ pub enum FieldType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepeatInfo {
     pub count: u64,
+    #[serde(default)]
+    pub stride: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,4 +88,27 @@ pub struct FieldDef {
     pub endianness: Option<Endianness>,
     pub description: Option<String>,
     pub repeat: Option<RepeatInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructureDef {
+    pub name: String,
+    pub fields: Vec<FieldDef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructInstanceDef {
+    pub name: String,
+    #[serde(rename = "struct")]
+    pub struct_name: String,
+    pub offset: OffsetKind,
+    pub description: Option<String>,
+    pub repeat: Option<RepeatInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FieldItem {
+    Field(FieldDef),
+    StructInstance(StructInstanceDef),
 }

@@ -62,6 +62,15 @@ pub enum InterpretError {
     #[error("expression resolved to a negative dynamic offset")]
     NegativeExpressionOffset,
 
+    #[error("relative offset cannot be resolved without a structure base")]
+    RelativeOffsetWithoutBase,
+
+    #[error("unknown structure `{name}`")]
+    UnknownStructure { name: String },
+
+    #[error("repeated structure `{name}` is missing an explicit stride")]
+    MissingStructStride { name: String },
+
     #[error("unsupported field type in this core version")]
     Unsupported,
 }
