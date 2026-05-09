@@ -7,7 +7,7 @@ use serde_yaml::{Mapping, Value};
 
 use crate::ast::{
     Endianness, FieldDef, FieldItem, FieldType, IntExpr, LengthSpec, OffsetKind, Schema,
-    StructInstanceDef, StructureDef,
+    StructInstanceDef, StructureDef, WhenCondition, WhenOp,
 };
 use crate::error::SchemaError;
 
@@ -195,6 +195,10 @@ fn validate_field_def(
         }
     }
 
+    if let Some(condition) = &field.when {
+        validate_when_condition(condition, &field_label)?;
+    }
+
     match field.ty {
         FieldType::Bytes | FieldType::Ascii => match &field.length {
             Some(LengthSpec::Literal(length)) if *length > 0 => {}
@@ -329,6 +333,31 @@ fn validate_struct_instance(
                     "{field_label} repeats a structure and must specify repeat stride"
                 )))
             }
+        }
+    }
+
+    if let Some(condition) = &instance.when {
+        validate_when_condition(condition, &field_label)?;
+    }
+
+    Ok(())
+}
+
+fn validate_when_condition(
+    condition: &WhenCondition,
+    field_label: &str,
+) -> Result<(), SchemaError> {
+    if condition.field.trim().is_empty() {
+        return Err(SchemaError::Validation(format!(
+            "{field_label} uses a condition with an empty field reference"
+        )));
+    }
+
+    if let WhenOp::BitSet(bit) = condition.op {
+        if bit > 63 {
+            return Err(SchemaError::Validation(format!(
+                "{field_label} uses bit_set index {bit}; maximum supported index is 63"
+            )));
         }
     }
 
@@ -573,7 +602,7 @@ fn normalize_for_cycle(path: &Path) -> Result<PathBuf, SchemaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{FieldDef, IntExprOp, RepeatInfo};
+    use crate::ast::{FieldDef, IntExprOp, RepeatInfo, WhenOp};
     use proptest::prelude::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -598,6 +627,13 @@ mod tests {
         }
     }
 
+    fn struct_instance(schema: &Schema, index: usize) -> &StructInstanceDef {
+        match &schema.fields[index] {
+            FieldItem::StructInstance(instance) => instance,
+            FieldItem::Field(_) => panic!("expected struct instance at index {index}"),
+        }
+    }
+
     fn item_name(item: &FieldItem) -> &str {
         match item {
             FieldItem::Field(field) => field.name.as_str(),
@@ -619,6 +655,7 @@ mod tests {
                 endianness: None,
                 description: None,
                 repeat: None,
+                when: None,
             }],
         }
     }
@@ -918,6 +955,205 @@ fields:
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parse_schema_accepts_when_on_scalar_struct_instance_and_child_field() {
+        let yaml = r#"
+schema_name: "Conditional"
+schema_version: 1
+endianness: little
+structures:
+  - name: packet
+    fields:
+      - name: flags
+        type: u16
+        offset: { kind: Relative, value: 0 }
+      - name: payload
+        type: bytes
+        offset: { kind: Relative, value: 2 }
+        length: 2
+        when:
+          field: packet.flags
+          bit_set: 2
+fields:
+  - name: product_code
+    type: u16
+    offset: { kind: Absolute, value: 0 }
+  - name: extra
+    type: u8
+    offset: { kind: Absolute, value: 2 }
+    when:
+      field: product_code
+      not_equals: 94
+  - name: packet
+    struct: packet
+    offset: { kind: Absolute, value: 4 }
+    when:
+      field: product_code
+      equals: 94
+"#;
+
+        let schema = parse_schema_str(yaml).expect("conditional schema should parse");
+
+        assert!(matches!(
+            field(&schema, 1)
+                .when
+                .as_ref()
+                .map(|condition| &condition.op),
+            Some(WhenOp::NotEquals(94))
+        ));
+        assert!(matches!(
+            struct_instance(&schema, 2)
+                .when
+                .as_ref()
+                .map(|condition| &condition.op),
+            Some(WhenOp::Equals(94))
+        ));
+        assert!(matches!(
+            schema.structures[0].fields[1]
+                .when
+                .as_ref()
+                .map(|condition| &condition.op),
+            Some(WhenOp::BitSet(2))
+        ));
+    }
+
+    #[test]
+    fn when_condition_serializes_in_public_yaml_shape() {
+        let yaml = r#"
+schema_name: "Conditional"
+schema_version: 1
+fields:
+  - name: flags
+    type: u8
+    offset: { kind: Absolute, value: 0 }
+  - name: payload
+    type: u8
+    offset: { kind: Absolute, value: 1 }
+    when:
+      field: flags
+      bit_set: 2
+"#;
+
+        let schema = parse_schema_str(yaml).expect("conditional schema should parse");
+        let serialized = serde_yaml::to_string(&schema).expect("schema should serialize");
+
+        assert!(serialized.contains("field: flags"));
+        assert!(serialized.contains("bit_set: 2"));
+        assert!(!serialized.contains("op:"));
+        parse_schema_str(&serialized).expect("serialized condition should parse again");
+    }
+
+    #[test]
+    fn parse_schema_rejects_when_with_empty_field_reference() {
+        let yaml = r#"
+schema_name: "Conditional"
+schema_version: 1
+fields:
+  - name: value
+    type: u8
+    offset: { kind: Absolute, value: 0 }
+    when:
+      field: ""
+      equals: 1
+"#;
+
+        expect_validation_error(yaml);
+    }
+
+    #[test]
+    fn parse_schema_rejects_when_without_operator() {
+        let yaml = r#"
+schema_name: "Conditional"
+schema_version: 1
+fields:
+  - name: value
+    type: u8
+    offset: { kind: Absolute, value: 0 }
+    when:
+      field: flags
+"#;
+
+        let err = parse_schema_str(yaml).unwrap_err();
+        assert!(matches!(err, SchemaError::Yaml(_)));
+        assert!(err.to_string().contains("exactly one"));
+    }
+
+    #[test]
+    fn parse_schema_rejects_when_with_multiple_operators() {
+        let yaml = r#"
+schema_name: "Conditional"
+schema_version: 1
+fields:
+  - name: value
+    type: u8
+    offset: { kind: Absolute, value: 0 }
+    when:
+      field: flags
+      equals: 1
+      not_equals: 2
+"#;
+
+        let err = parse_schema_str(yaml).unwrap_err();
+        assert!(matches!(err, SchemaError::Yaml(_)));
+        assert!(err.to_string().contains("multiple operators"));
+    }
+
+    #[test]
+    fn parse_schema_rejects_when_with_unsupported_operator() {
+        let yaml = r#"
+schema_name: "Conditional"
+schema_version: 1
+fields:
+  - name: value
+    type: u8
+    offset: { kind: Absolute, value: 0 }
+    when:
+      field: flags
+      greater_than: 1
+"#;
+
+        let err = parse_schema_str(yaml).unwrap_err();
+        assert!(matches!(err, SchemaError::Yaml(_)));
+        assert!(err.to_string().contains("greater_than"));
+    }
+
+    #[test]
+    fn parse_schema_rejects_when_with_non_integer_operator_value() {
+        let yaml = r#"
+schema_name: "Conditional"
+schema_version: 1
+fields:
+  - name: value
+    type: u8
+    offset: { kind: Absolute, value: 0 }
+    when:
+      field: flags
+      equals: yes
+"#;
+
+        let err = parse_schema_str(yaml).unwrap_err();
+        assert!(matches!(err, SchemaError::Yaml(_)));
+    }
+
+    #[test]
+    fn parse_schema_rejects_when_with_bit_set_above_max() {
+        let yaml = r#"
+schema_name: "Conditional"
+schema_version: 1
+fields:
+  - name: value
+    type: u8
+    offset: { kind: Absolute, value: 0 }
+    when:
+      field: flags
+      bit_set: 64
+"#;
+
+        let err = parse_schema_str(yaml).unwrap_err();
+        assert!(matches!(err, SchemaError::Validation(_)));
+        assert!(err.to_string().contains("maximum supported index is 63"));
     }
 
     #[test]
@@ -1982,6 +2218,7 @@ fields:
                     endianness,
                     description,
                     repeat,
+                    when: None,
                 },
             )
     }

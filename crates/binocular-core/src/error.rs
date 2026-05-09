@@ -26,6 +26,15 @@ pub enum InterpretError {
     #[error("field `{field}` resolved to a negative dynamic offset")]
     NegativeOffsetReference { field: String },
 
+    #[error("missing condition reference `{field}`")]
+    MissingConditionReference { field: String },
+
+    #[error("field `{field}` cannot be used as a condition source")]
+    InvalidConditionReferenceType { field: String },
+
+    #[error("field `{field}` resolved to a negative bit_set condition source")]
+    NegativeBitSetConditionSource { field: String },
+
     #[error("missing expression reference `{field}`")]
     MissingExpressionReference { field: String },
 

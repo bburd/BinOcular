@@ -4,7 +4,7 @@ use crate::buffer::FileBuffer;
 use crate::error::InterpretError;
 use binocular_schema::ast::{
     Endianness, FieldDef, FieldItem, FieldType, IntExpr, LengthSpec, OffsetKind, Schema,
-    StructInstanceDef, StructureDef,
+    StructInstanceDef, StructureDef, WhenCondition, WhenOp,
 };
 
 #[derive(Debug, Clone)]
@@ -123,6 +123,10 @@ fn interpret_scalar_repeats<B: FileBuffer + ?Sized>(
     context: &mut FieldContext,
     rows: &mut Vec<FieldEval>,
 ) {
+    if !should_interpret_field(field, &field.name, context, rows) {
+        return;
+    }
+
     let count = field.repeat.as_ref().map_or(1, |repeat| repeat.count);
 
     for index in 0..count {
@@ -173,6 +177,17 @@ fn interpret_struct_instance<B: FileBuffer + ?Sized>(
         return;
     };
 
+    if let Some(condition) = &instance.when {
+        match eval_when(condition, context) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                push_struct_instance_error_rows(rows, instance, Some(structure), None, err);
+                return;
+            }
+        }
+    }
+
     let count = instance.repeat.as_ref().map_or(1, |repeat| repeat.count);
     let stride = match instance.repeat.as_ref().and_then(|repeat| repeat.stride) {
         Some(stride) => Some(stride),
@@ -208,6 +223,11 @@ fn interpret_struct_instance<B: FileBuffer + ?Sized>(
         };
 
         for child in &structure.fields {
+            let child_display_name = struct_child_base_display_name(instance, child, index);
+            if !should_interpret_field(child, &child_display_name, context, rows) {
+                continue;
+            }
+
             let child_count = child.repeat.as_ref().map_or(1, |repeat| repeat.count);
 
             for child_index in 0..child_count {
@@ -231,6 +251,26 @@ fn interpret_struct_instance<B: FileBuffer + ?Sized>(
                     rows,
                 );
             }
+        }
+    }
+}
+
+fn should_interpret_field(
+    field: &FieldDef,
+    display_name: &str,
+    context: &FieldContext,
+    rows: &mut Vec<FieldEval>,
+) -> bool {
+    let Some(condition) = &field.when else {
+        return true;
+    };
+
+    match eval_when(condition, context) {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(err) => {
+            push_error_row(rows, field, display_name.to_string(), 0, false, 0, err);
+            false
         }
     }
 }
@@ -348,6 +388,18 @@ fn struct_child_display_name(
         format!("{}[{instance_index}].{child_name}", instance.name)
     } else {
         format!("{}.{}", instance.name, child_name)
+    }
+}
+
+fn struct_child_base_display_name(
+    instance: &StructInstanceDef,
+    child: &FieldDef,
+    instance_index: u64,
+) -> String {
+    if instance.repeat.is_some() {
+        format!("{}[{instance_index}].{}", instance.name, child.name)
+    } else {
+        format!("{}.{}", instance.name, child.name)
     }
 }
 
@@ -518,6 +570,43 @@ fn resolve_expression_reference(
     }
 }
 
+fn eval_when(condition: &WhenCondition, context: &FieldContext) -> Result<bool, InterpretError> {
+    let value = resolve_condition_reference(&condition.field, context)?;
+    match condition.op {
+        WhenOp::Equals(expected) => Ok(value == expected),
+        WhenOp::NotEquals(expected) => Ok(value != expected),
+        WhenOp::BitSet(bit) => {
+            if value < 0 {
+                return Err(InterpretError::NegativeBitSetConditionSource {
+                    field: condition.field.clone(),
+                });
+            }
+
+            let mask = 1_i128 << bit;
+            Ok(value & mask != 0)
+        }
+    }
+}
+
+fn resolve_condition_reference(
+    referenced: &str,
+    context: &FieldContext,
+) -> Result<i128, InterpretError> {
+    let Some(value) = context.get(referenced).copied() else {
+        return Err(InterpretError::MissingConditionReference {
+            field: referenced.to_string(),
+        });
+    };
+
+    match value {
+        ContextValue::NonNumeric => Err(InterpretError::InvalidConditionReferenceType {
+            field: referenced.to_string(),
+        }),
+        ContextValue::Numeric(NumericContextValue::Unsigned(value)) => Ok(value as i128),
+        ContextValue::Numeric(NumericContextValue::Signed(value)) => Ok(value as i128),
+    }
+}
+
 fn resolve_dynamic_length(
     referenced: &str,
     context: &FieldContext,
@@ -682,7 +771,7 @@ mod tests {
     use crate::buffer::MemoryBuffer;
     use binocular_schema::ast::{
         Endianness, FieldDef, FieldItem, FieldType, IntExpr, IntExprOp, LengthSpec, OffsetKind,
-        Schema, StructInstanceDef, StructureDef,
+        Schema, StructInstanceDef, StructureDef, WhenCondition, WhenOp,
     };
 
     macro_rules! fields {
@@ -705,6 +794,7 @@ mod tests {
             endianness,
             description: None,
             repeat: None,
+            when: None,
         }
     }
 
@@ -717,6 +807,33 @@ mod tests {
             endianness: None,
             description: None,
             repeat: None,
+            when: None,
+        }
+    }
+
+    fn with_when(mut field: FieldDef, condition: WhenCondition) -> FieldDef {
+        field.when = Some(condition);
+        field
+    }
+
+    fn when_equals(field: &str, value: i128) -> WhenCondition {
+        WhenCondition {
+            field: field.to_string(),
+            op: WhenOp::Equals(value),
+        }
+    }
+
+    fn when_not_equals(field: &str, value: i128) -> WhenCondition {
+        WhenCondition {
+            field: field.to_string(),
+            op: WhenOp::NotEquals(value),
+        }
+    }
+
+    fn when_bit_set(field: &str, bit: u8) -> WhenCondition {
+        WhenCondition {
+            field: field.to_string(),
+            op: WhenOp::BitSet(bit),
         }
     }
 
@@ -804,6 +921,202 @@ mod tests {
         assert!(second.value.is_none());
         let err = second.error.clone().expect("expected an error");
         assert!(err.contains("buffer error"));
+    }
+
+    #[test]
+    fn when_equals_true_emits_field() {
+        let buffer = MemoryBuffer::from_vec(vec![1, 0, 0xAA]);
+        let schema = Schema {
+            schema_name: "when_equals_true".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            structures: vec![],
+            fields: fields![
+                make_field("product_code", FieldType::U16, 0, None),
+                with_when(
+                    make_field("payload", FieldType::U8, 2, None),
+                    when_equals("product_code", 1),
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].display_name, "payload");
+        assert_uint(results[1].value.clone().unwrap(), 0xAA);
+    }
+
+    #[test]
+    fn when_equals_false_omits_field() {
+        let buffer = MemoryBuffer::from_vec(vec![2, 0, 0xAA, 0xBB]);
+        let schema = Schema {
+            schema_name: "when_equals_false".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            structures: vec![],
+            fields: fields![
+                make_field("product_code", FieldType::U16, 0, None),
+                with_when(
+                    make_field("payload", FieldType::U8, 2, None),
+                    when_equals("product_code", 1),
+                ),
+                make_field("tail", FieldType::U8, 3, None),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        let names = results
+            .iter()
+            .map(|result| result.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["product_code", "tail"]);
+        assert_uint(results[1].value.clone().unwrap(), 0xBB);
+    }
+
+    #[test]
+    fn when_not_equals_true_and_false_follow_expected_rows() {
+        let buffer = MemoryBuffer::from_vec(vec![1, 0, 0xAA, 0xBB]);
+        let schema = Schema {
+            schema_name: "when_not_equals".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            structures: vec![],
+            fields: fields![
+                make_field("product_code", FieldType::U16, 0, None),
+                with_when(
+                    make_field("included", FieldType::U8, 2, None),
+                    when_not_equals("product_code", 94),
+                ),
+                with_when(
+                    make_field("skipped", FieldType::U8, 3, None),
+                    when_not_equals("product_code", 1),
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        let names = results
+            .iter()
+            .map(|result| result.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["product_code", "included"]);
+        assert_uint(results[1].value.clone().unwrap(), 0xAA);
+    }
+
+    #[test]
+    fn when_bit_set_true_and_false_follow_expected_rows() {
+        let buffer = MemoryBuffer::from_vec(vec![0b0000_0100, 0xAA, 0xBB]);
+        let schema = Schema {
+            schema_name: "when_bit_set".to_string(),
+            schema_version: 1,
+            endianness: None,
+            structures: vec![],
+            fields: fields![
+                make_field("flags", FieldType::U8, 0, None),
+                with_when(
+                    make_field("included", FieldType::U8, 1, None),
+                    when_bit_set("flags", 2),
+                ),
+                with_when(
+                    make_field("skipped", FieldType::U8, 2, None),
+                    when_bit_set("flags", 1),
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        let names = results
+            .iter()
+            .map(|result| result.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["flags", "included"]);
+        assert_uint(results[1].value.clone().unwrap(), 0xAA);
+    }
+
+    #[test]
+    fn when_missing_reference_emits_error_and_later_fields_continue() {
+        let buffer = MemoryBuffer::from_vec(vec![0xAA, 0xBB]);
+        let schema = Schema {
+            schema_name: "when_missing".to_string(),
+            schema_version: 1,
+            endianness: None,
+            structures: vec![],
+            fields: fields![
+                with_when(
+                    make_field("payload", FieldType::U8, 0, None),
+                    when_equals("missing", 1),
+                ),
+                make_field("tail", FieldType::U8, 1, None),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].display_name, "payload");
+        assert_eq!(results[0].resolved_offset, 0);
+        assert!(!results[0].offset_valid);
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some("missing condition reference `missing`")
+        );
+        assert_eq!(results[1].display_name, "tail");
+        assert_uint(results[1].value.clone().unwrap(), 0xBB);
+    }
+
+    #[test]
+    fn when_non_numeric_reference_emits_error() {
+        let buffer = MemoryBuffer::from_vec(vec![b'O', b'K', 0xAA]);
+        let schema = Schema {
+            schema_name: "when_non_numeric".to_string(),
+            schema_version: 1,
+            endianness: None,
+            structures: vec![],
+            fields: fields![
+                make_sized_field("label", FieldType::Ascii, 0, LengthSpec::Literal(2)),
+                with_when(
+                    make_field("payload", FieldType::U8, 2, None),
+                    when_equals("label", 1),
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `label` cannot be used as a condition source")
+        );
+        assert!(!results[1].offset_valid);
+    }
+
+    #[test]
+    fn when_bit_set_rejects_negative_signed_source() {
+        let buffer = MemoryBuffer::from_vec(vec![0xFF, 0xFF, 0xFF, 0xFF, 0xAA]);
+        let schema = Schema {
+            schema_name: "when_negative_bit_set".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            structures: vec![],
+            fields: fields![
+                make_field("flags", FieldType::I32, 0, None),
+                with_when(
+                    make_field("payload", FieldType::U8, 4, None),
+                    when_bit_set("flags", 0),
+                ),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+
+        assert_eq!(
+            results[1].error.as_deref(),
+            Some("field `flags` resolved to a negative bit_set condition source")
+        );
     }
 
     #[test]
@@ -998,6 +1311,7 @@ mod tests {
             endianness: None,
             description: None,
             repeat: None,
+            when: None,
         };
 
         let value = interpret_field(&buffer, &field, None).unwrap();
@@ -1015,6 +1329,7 @@ mod tests {
             endianness: None,
             description: None,
             repeat: None,
+            when: None,
         };
 
         let err = interpret_field(&buffer, &field, None).unwrap_err();
@@ -1038,8 +1353,9 @@ mod tests {
                 description: None,
                 repeat: Some(binocular_schema::ast::RepeatInfo {
                     count: 3,
-                    stride: None
+                    stride: None,
                 }),
+                when: None,
             }],
         };
 
@@ -1082,8 +1398,9 @@ mod tests {
                 description: None,
                 repeat: Some(binocular_schema::ast::RepeatInfo {
                     count: 2,
-                    stride: None
+                    stride: None,
                 }),
+                when: None,
             }],
         };
 
@@ -1123,8 +1440,9 @@ mod tests {
                 description: None,
                 repeat: Some(binocular_schema::ast::RepeatInfo {
                     count: 3,
-                    stride: None
+                    stride: None,
                 }),
+                when: None,
             }],
         };
 
@@ -1166,8 +1484,9 @@ mod tests {
                 description: None,
                 repeat: Some(binocular_schema::ast::RepeatInfo {
                     count: 2,
-                    stride: None
+                    stride: None,
                 }),
+                when: None,
             }],
         };
 
@@ -1212,6 +1531,7 @@ mod tests {
                         endianness: None,
                         description: None,
                         repeat: None,
+                        when: None,
                     },
                     FieldDef {
                         name: "length".to_string(),
@@ -1221,6 +1541,7 @@ mod tests {
                         endianness: None,
                         description: None,
                         repeat: None,
+                        when: None,
                     },
                 ],
             }],
@@ -1230,6 +1551,7 @@ mod tests {
                 offset: OffsetKind::Absolute(0),
                 description: None,
                 repeat: None,
+                when: None,
             })],
         };
 
@@ -1261,6 +1583,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 }],
             }],
             fields: vec![FieldItem::StructInstance(StructInstanceDef {
@@ -1272,6 +1595,7 @@ mod tests {
                     count: 2,
                     stride: Some(4),
                 }),
+                when: None,
             })],
         };
 
@@ -1284,6 +1608,226 @@ mod tests {
         assert_eq!(results[1].display_name, "records[1].id");
         assert_eq!(results[1].resolved_offset, 4);
         assert_uint(results[1].value.clone().unwrap(), 2);
+    }
+
+    #[test]
+    fn when_false_on_struct_instance_skips_all_children() {
+        let buffer = MemoryBuffer::from_vec(vec![2, 0, 0xCD, 0xAB, 4, 0, 0xEE]);
+        let schema = Schema {
+            schema_name: "conditional_struct".to_string(),
+            schema_version: 1,
+            endianness: Some(Endianness::Little),
+            structures: vec![StructureDef {
+                name: "header".to_string(),
+                fields: vec![
+                    make_field("magic", FieldType::U16, 0, None),
+                    make_field("length", FieldType::U16, 2, None),
+                ],
+            }],
+            fields: vec![
+                FieldItem::Field(make_field("product_code", FieldType::U16, 0, None)),
+                FieldItem::StructInstance(StructInstanceDef {
+                    name: "header".to_string(),
+                    struct_name: "header".to_string(),
+                    offset: OffsetKind::Absolute(2),
+                    description: None,
+                    repeat: None,
+                    when: Some(when_equals("product_code", 94)),
+                }),
+                FieldItem::Field(make_field("tail", FieldType::U8, 6, None)),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        let names = results
+            .iter()
+            .map(|result| result.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["product_code", "tail"]);
+        assert_uint(results[1].value.clone().unwrap(), 0xEE);
+    }
+
+    #[test]
+    fn when_error_on_struct_instance_emits_child_error_rows() {
+        let schema = Schema {
+            schema_name: "conditional_struct_error".to_string(),
+            schema_version: 1,
+            endianness: None,
+            structures: vec![StructureDef {
+                name: "header".to_string(),
+                fields: vec![
+                    make_field("magic", FieldType::U16, 0, None),
+                    make_field("length", FieldType::U16, 2, None),
+                ],
+            }],
+            fields: vec![FieldItem::StructInstance(StructInstanceDef {
+                name: "header".to_string(),
+                struct_name: "header".to_string(),
+                offset: OffsetKind::Absolute(0),
+                description: None,
+                repeat: None,
+                when: Some(when_equals("missing", 1)),
+            })],
+        };
+
+        let results = interpret_schema(&MemoryBuffer::from_vec(vec![0xAA, 0xBB]), &schema);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].display_name, "header.magic");
+        assert_eq!(results[1].display_name, "header.length");
+        assert!(results.iter().all(|result| !result.offset_valid));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.error.as_deref()
+                    == Some("missing condition reference `missing`"))
+        );
+    }
+
+    #[test]
+    fn when_false_on_struct_child_skips_only_that_child() {
+        let buffer = MemoryBuffer::from_vec(vec![0b0000_0010, 0xAA, 0xBB]);
+        let schema = Schema {
+            schema_name: "conditional_child".to_string(),
+            schema_version: 1,
+            endianness: None,
+            structures: vec![StructureDef {
+                name: "packet".to_string(),
+                fields: vec![
+                    FieldDef {
+                        name: "flags".to_string(),
+                        ty: FieldType::U8,
+                        offset: OffsetKind::Relative(0),
+                        length: None,
+                        endianness: None,
+                        description: None,
+                        repeat: None,
+                        when: None,
+                    },
+                    FieldDef {
+                        name: "skipped".to_string(),
+                        ty: FieldType::U8,
+                        offset: OffsetKind::Relative(1),
+                        length: None,
+                        endianness: None,
+                        description: None,
+                        repeat: None,
+                        when: Some(when_bit_set("packet.flags", 0)),
+                    },
+                    FieldDef {
+                        name: "included".to_string(),
+                        ty: FieldType::U8,
+                        offset: OffsetKind::Relative(2),
+                        length: None,
+                        endianness: None,
+                        description: None,
+                        repeat: None,
+                        when: Some(when_bit_set("packet.flags", 1)),
+                    },
+                ],
+            }],
+            fields: vec![FieldItem::StructInstance(StructInstanceDef {
+                name: "packet".to_string(),
+                struct_name: "packet".to_string(),
+                offset: OffsetKind::Absolute(0),
+                description: None,
+                repeat: None,
+                when: None,
+            })],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        let names = results
+            .iter()
+            .map(|result| result.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["packet.flags", "packet.included"]);
+        assert_uint(results[1].value.clone().unwrap(), 0xBB);
+    }
+
+    #[test]
+    fn when_on_repeated_scalar_applies_once_before_repeat_expansion() {
+        let buffer = MemoryBuffer::from_vec(vec![1, 0x10, 0x20, 0x30]);
+        let schema = Schema {
+            schema_name: "conditional_repeat_scalar".to_string(),
+            schema_version: 1,
+            endianness: None,
+            structures: vec![],
+            fields: fields![
+                make_field("enabled", FieldType::U8, 0, None),
+                FieldDef {
+                    name: "values".to_string(),
+                    ty: FieldType::U8,
+                    offset: OffsetKind::Absolute(1),
+                    length: None,
+                    endianness: None,
+                    description: None,
+                    repeat: Some(binocular_schema::ast::RepeatInfo {
+                        count: 3,
+                        stride: None,
+                    }),
+                    when: Some(when_equals("enabled", 1)),
+                },
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        let names = results
+            .iter()
+            .map(|result| result.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["enabled", "values[0]", "values[1]", "values[2]"]
+        );
+    }
+
+    #[test]
+    fn when_on_repeated_struct_applies_once_before_repeat_expansion() {
+        let buffer = MemoryBuffer::from_vec(vec![1, 0x10, 0x20]);
+        let schema = Schema {
+            schema_name: "conditional_repeat_struct".to_string(),
+            schema_version: 1,
+            endianness: None,
+            structures: vec![StructureDef {
+                name: "record".to_string(),
+                fields: vec![FieldDef {
+                    name: "id".to_string(),
+                    ty: FieldType::U8,
+                    offset: OffsetKind::Relative(0),
+                    length: None,
+                    endianness: None,
+                    description: None,
+                    repeat: None,
+                    when: None,
+                }],
+            }],
+            fields: vec![
+                FieldItem::Field(make_field("enabled", FieldType::U8, 0, None)),
+                FieldItem::StructInstance(StructInstanceDef {
+                    name: "records".to_string(),
+                    struct_name: "record".to_string(),
+                    offset: OffsetKind::Absolute(1),
+                    description: None,
+                    repeat: Some(binocular_schema::ast::RepeatInfo {
+                        count: 2,
+                        stride: Some(1),
+                    }),
+                    when: Some(when_equals("enabled", 1)),
+                }),
+            ],
+        };
+
+        let results = interpret_schema(&buffer, &schema);
+        let names = results
+            .iter()
+            .map(|result| result.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["enabled", "records[0].id", "records[1].id"]);
     }
 
     #[test]
@@ -1303,6 +1847,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 }],
             }],
             fields: vec![FieldItem::StructInstance(StructInstanceDef {
@@ -1311,6 +1856,7 @@ mod tests {
                 offset: OffsetKind::Absolute(1),
                 description: None,
                 repeat: None,
+                when: None,
             })],
         };
 
@@ -1339,6 +1885,7 @@ mod tests {
                         endianness: None,
                         description: None,
                         repeat: None,
+                        when: None,
                     },
                     FieldDef {
                         name: "too_wide".to_string(),
@@ -1348,6 +1895,7 @@ mod tests {
                         endianness: None,
                         description: None,
                         repeat: None,
+                        when: None,
                     },
                 ],
             }],
@@ -1357,6 +1905,7 @@ mod tests {
                 offset: OffsetKind::Absolute(0),
                 description: None,
                 repeat: None,
+                when: None,
             })],
         };
 
@@ -1389,6 +1938,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 }],
             }],
             fields: vec![FieldItem::StructInstance(StructInstanceDef {
@@ -1397,6 +1947,7 @@ mod tests {
                 offset: OffsetKind::FieldRef("missing_offset".to_string()),
                 description: None,
                 repeat: None,
+                when: None,
             })],
         };
 
@@ -1430,6 +1981,7 @@ mod tests {
                         endianness: None,
                         description: None,
                         repeat: None,
+                        when: None,
                     },
                     FieldDef {
                         name: "payload".to_string(),
@@ -1441,6 +1993,7 @@ mod tests {
                         endianness: None,
                         description: None,
                         repeat: None,
+                        when: None,
                     },
                 ],
             }],
@@ -1450,6 +2003,7 @@ mod tests {
                 offset: OffsetKind::Absolute(0),
                 description: None,
                 repeat: None,
+                when: None,
             })],
         };
 
@@ -1569,8 +2123,9 @@ mod tests {
                     description: None,
                     repeat: Some(binocular_schema::ast::RepeatInfo {
                         count: 2,
-                        stride: None
+                        stride: None,
                     }),
+                    when: None,
                 },
                 make_sized_field(
                     "payload",
@@ -1913,6 +2468,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 },
             ],
         };
@@ -1943,6 +2499,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 },
             ],
         };
@@ -1973,6 +2530,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 },
             ],
         };
@@ -2001,6 +2559,7 @@ mod tests {
                 endianness: None,
                 description: None,
                 repeat: None,
+                when: None,
             }],
         };
 
@@ -2031,6 +2590,7 @@ mod tests {
                 endianness: None,
                 description: None,
                 repeat: None,
+                when: None,
             }],
         };
 
@@ -2061,6 +2621,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 },
             ],
         };
@@ -2091,6 +2652,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 },
             ],
         };
@@ -2121,6 +2683,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 },
             ],
         };
@@ -2151,6 +2714,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 },
             ],
         };
@@ -2178,6 +2742,7 @@ mod tests {
                 endianness: None,
                 description: None,
                 repeat: None,
+                when: None,
             }],
         };
 
@@ -2207,6 +2772,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 },
                 make_field("tail", FieldType::U16, 2, None),
             ],
@@ -2239,6 +2805,7 @@ mod tests {
                     endianness: None,
                     description: None,
                     repeat: None,
+                    when: None,
                 },
                 make_field("tail", FieldType::U16, 2, None),
             ],
@@ -2269,6 +2836,7 @@ mod tests {
                 endianness: None,
                 description: None,
                 repeat: None,
+                when: None,
             }],
         };
 
@@ -2294,6 +2862,7 @@ mod tests {
                 endianness: None,
                 description: None,
                 repeat: None,
+                when: None,
             }],
         };
 

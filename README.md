@@ -27,6 +27,7 @@ Use it when you have a binary file, some knowledge of its structure, and want a 
 - YAML-based binary schemas
 - File includes and fixed-count repeats
 - Dynamic lengths and offsets from earlier fields
+- Conditional fields and structure instances with `when`
 - Simple integer expressions (`add` / `sub`)
 - Reusable structures that expand to flat dotted field names
 
@@ -136,6 +137,32 @@ fields:
 
 This emits flat rows such as `header.magic` and `header.length`, so CLI and GUI output stay table-friendly.
 
+Fields and structure instances can be conditional on earlier numeric values:
+
+```yaml
+fields:
+  - name: product_code
+    type: u16
+    offset: { kind: Absolute, value: 0 }
+
+  - name: radial_packet
+    struct: radial_packet
+    offset: { kind: Absolute, value: 64 }
+    when:
+      field: product_code
+      equals: 94
+
+  - name: extra_flags
+    type: bytes
+    offset: { kind: Absolute, value: 128 }
+    length: 4
+    when:
+      field: flags
+      bit_set: 2
+```
+
+When a condition is false, the item is omitted from interpreted output.
+
 Example output:
 
 ```text
@@ -169,12 +196,13 @@ The GUI can:
 
 ## Current Capabilities
 
-As of v0.7.0, BinOcular supports:
+As of v0.8.0, BinOcular supports:
 
 - Dynamic schema-driven parsing
 - Repeat fields and schema includes
 - Reusable schema structures with flat output names
 - Runtime-computed lengths and offsets
+- Conditional scalar fields and structure instances
 - Interactive GUI inspection with highlighting and search
 - Large-file mmap-backed inspection
 
@@ -185,7 +213,6 @@ BinOcular is currently read-only. It is a binary inspection tool, not a full hex
 Not currently supported:
 
 - Nested struct instances
-- Conditional fields
 - Multiplication/division in expressions
 - Regex search
 - Hex-pattern search

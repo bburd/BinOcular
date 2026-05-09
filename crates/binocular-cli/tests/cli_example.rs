@@ -276,6 +276,125 @@ fields:
 }
 
 #[test]
+fn conditional_fields_are_omitted_from_json_when_false() -> Result<(), Box<dyn std::error::Error>> {
+    let schema_path = unique_temp_path("conditional_omit_schema", "yaml");
+    let bin_path = unique_temp_path("conditional_omit_data", "bin");
+
+    let schema = r#"
+schema_name: "ConditionalOmit"
+schema_version: 1
+endianness: little
+fields:
+  - name: "product_code"
+    type: u16
+    offset:
+      kind: Absolute
+      value: 0
+  - name: "radial_packet"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 2
+    when:
+      field: product_code
+      equals: 94
+  - name: "tail"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 3
+"#;
+
+    fs::write(&schema_path, schema)?;
+    fs::write(&bin_path, [93_u8, 0, 0xAA, 0xBB])?;
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--schema",
+            schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    remove_if_exists(&schema_path);
+    remove_if_exists(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    let names = records
+        .iter()
+        .map(|record| record.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, vec!["product_code", "tail"]);
+    assert_eq!(records[1].value.as_u64(), Some(0xBB));
+
+    Ok(())
+}
+
+#[test]
+fn conditional_field_errors_are_serialized_as_json_rows() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema_path = unique_temp_path("conditional_error_schema", "yaml");
+    let bin_path = unique_temp_path("conditional_error_data", "bin");
+
+    let schema = r#"
+schema_name: "ConditionalError"
+schema_version: 1
+fields:
+  - name: "payload"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 0
+    when:
+      field: missing
+      equals: 1
+  - name: "tail"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 1
+"#;
+
+    fs::write(&schema_path, schema)?;
+    fs::write(&bin_path, [0xAA_u8, 0xBB])?;
+
+    let output = cargo_bin_cmd!("binocular-cli")
+        .args([
+            "--json",
+            "--schema",
+            schema_path.to_str().ok_or("Invalid schema path")?,
+            bin_path.to_str().ok_or("Invalid binary path")?,
+        ])
+        .output()?;
+
+    remove_if_exists(&schema_path);
+    remove_if_exists(&bin_path);
+
+    assert!(output.status.success(), "CLI did not exit successfully");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let records: Vec<Record> = serde_json::from_str(&stdout)?;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].name, "payload");
+    assert_eq!(records[0].offset, None);
+    assert_eq!(records[0].offset_hex, None);
+    assert_eq!(records[0].value, Value::Null);
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some("missing condition reference `missing`")
+    );
+    assert_eq!(records[1].name, "tail");
+    assert_eq!(records[1].value.as_u64(), Some(0xBB));
+
+    Ok(())
+}
+
+#[test]
 fn included_schema_outputs_expected_field_order() -> Result<(), Box<dyn std::error::Error>> {
     let root_schema_path = unique_temp_path("include_root_schema", "yaml");
     let common_schema_path = unique_temp_path("include_common_schema", "yaml");
