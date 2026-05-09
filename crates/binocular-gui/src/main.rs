@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, fs, path::PathBuf, sync::Arc};
 
 use binocular_core::buffer::{FileBuffer, MemoryBuffer, MmapBuffer};
 use binocular_core::interpret::{interpret_schema, FieldEval, FieldValue};
@@ -20,6 +20,12 @@ const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DISPLAY_BYTES: usize = 256;
 const SEARCH_CHUNK_SIZE: usize = 64 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchMode {
+    Ascii,
+    Hex,
+}
+
 struct Document {
     _path: PathBuf,
     name: String,
@@ -36,11 +42,15 @@ struct Document {
     selected_field_range: Option<(u64, usize)>,
     selected_field_name: Option<String>,
     search_query: String,
+    search_mode: SearchMode,
     active_search_query: String,
+    active_search_pattern_len: usize,
     search_matches: Vec<u64>,
     current_search_match: Option<usize>,
+    search_error: Option<String>,
     field_filter_query: String,
     field_filter_errors_only: bool,
+    collapsed_field_groups: HashSet<String>,
 }
 
 struct BinOcularApp {
@@ -153,11 +163,15 @@ impl BinOcularApp {
             selected_field_range: None,
             selected_field_name: None,
             search_query: String::new(),
+            search_mode: SearchMode::Ascii,
             active_search_query: String::new(),
+            active_search_pattern_len: 0,
             search_matches: Vec::new(),
             current_search_match: None,
+            search_error: None,
             field_filter_query: String::new(),
             field_filter_errors_only: false,
+            collapsed_field_groups: HashSet::new(),
         })
     }
 
@@ -236,15 +250,28 @@ impl Document {
     }
 
     fn find_search_matches(&mut self) -> Result<(), String> {
-        if self.search_query.is_empty() {
+        if self.search_query.trim().is_empty() {
             return Ok(());
         }
 
         let query = self.search_query.clone();
-        let matches = find_ascii_matches(self.buffer.as_ref(), self.size, query.as_bytes())?;
+        let pattern = match self.search_mode {
+            SearchMode::Ascii => query.as_bytes().to_vec(),
+            SearchMode::Hex => match parse_hex_pattern(&query) {
+                Ok(pattern) => pattern,
+                Err(err) => {
+                    self.clear_active_search();
+                    self.search_error = Some(err);
+                    return Ok(());
+                }
+            },
+        };
+        let matches = find_byte_pattern_matches(self.buffer.as_ref(), self.size, &pattern)?;
         self.active_search_query = query;
+        self.active_search_pattern_len = pattern.len();
         self.search_matches = matches;
         self.current_search_match = None;
+        self.search_error = None;
 
         if !self.search_matches.is_empty() {
             self.select_search_match(0);
@@ -255,7 +282,13 @@ impl Document {
 
     fn clear_search(&mut self) {
         self.search_query.clear();
+        self.clear_active_search();
+        self.search_error = None;
+    }
+
+    fn clear_active_search(&mut self) {
         self.active_search_query.clear();
+        self.active_search_pattern_len = 0;
         self.search_matches.clear();
         self.current_search_match = None;
     }
@@ -363,7 +396,7 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document, available_width: f32) {
     let visible_search_ranges = visible_search_ranges(
         &doc.search_matches,
         doc.current_search_match,
-        doc.active_search_query.len(),
+        doc.active_search_pattern_len,
         doc.hex_start_offset,
         visible_end,
     );
@@ -462,16 +495,45 @@ fn clicked_outside_regions(
     panel_rect.contains(click_pos) && !protected_rects.iter().any(|rect| rect.contains(click_pos))
 }
 
-fn find_ascii_matches(
-    buffer: &dyn FileBuffer,
-    file_size: u64,
-    query: &[u8],
-) -> Result<Vec<u64>, String> {
-    if query.is_empty() || u64::try_from(query.len()).unwrap_or(u64::MAX) > file_size {
+fn parse_hex_pattern(input: &str) -> Result<Vec<u8>, String> {
+    let mut digits = String::new();
+
+    for ch in input.trim().chars() {
+        if ch.is_ascii_hexdigit() {
+            digits.push(ch);
+        } else if !ch.is_whitespace() {
+            return Err(format!("Invalid hex pattern: unexpected character '{ch}'"));
+        }
+    }
+
+    if digits.is_empty() {
         return Ok(Vec::new());
     }
 
-    let overlap = query.len().saturating_sub(1);
+    if !digits.len().is_multiple_of(2) {
+        return Err("Invalid hex pattern: expected an even number of hex digits".to_string());
+    }
+
+    let mut bytes = Vec::with_capacity(digits.len() / 2);
+    for index in (0..digits.len()).step_by(2) {
+        let byte = u8::from_str_radix(&digits[index..index + 2], 16)
+            .map_err(|_| "Invalid hex pattern".to_string())?;
+        bytes.push(byte);
+    }
+
+    Ok(bytes)
+}
+
+fn find_byte_pattern_matches(
+    buffer: &dyn FileBuffer,
+    file_size: u64,
+    pattern: &[u8],
+) -> Result<Vec<u64>, String> {
+    if pattern.is_empty() || u64::try_from(pattern.len()).unwrap_or(u64::MAX) > file_size {
+        return Ok(Vec::new());
+    }
+
+    let overlap = pattern.len().saturating_sub(1);
     let read_budget = SEARCH_CHUNK_SIZE
         .checked_add(overlap)
         .ok_or_else(|| "Search query is too large".to_string())?;
@@ -491,10 +553,10 @@ fn find_ascii_matches(
         } else {
             bytes.len().saturating_sub(overlap)
         };
-        let scan_end = scan_len.min(bytes.len().saturating_sub(query.len()).saturating_add(1));
+        let scan_end = scan_len.min(bytes.len().saturating_sub(pattern.len()).saturating_add(1));
 
         for start in 0..scan_end {
-            if &bytes[start..start + query.len()] == query {
+            if &bytes[start..start + pattern.len()] == pattern {
                 matches.push(offset + start as u64);
             }
         }
@@ -613,12 +675,89 @@ fn field_matches_filter(eval: &FieldEval, query: &str, errors_only: bool) -> boo
         .contains(&query.to_lowercase())
 }
 
-fn draw_field_table(
-    ui: &mut egui::Ui,
-    evaluations: &[FieldEval],
-    selected_range: Option<(u64, usize)>,
+struct FieldTableWidths {
+    name: f32,
+    offset: f32,
+    ty: f32,
+    value: f32,
+    error: f32,
+}
+
+struct FieldTableChild<'a> {
+    name: String,
+    eval: &'a FieldEval,
+}
+
+enum FieldTableItem<'a> {
+    Ungrouped(&'a FieldEval),
+    Group {
+        name: String,
+        children: Vec<FieldTableChild<'a>>,
+    },
+}
+
+impl FieldTableItem<'_> {
+    fn field_count(&self) -> usize {
+        match self {
+            FieldTableItem::Ungrouped(_) => 1,
+            FieldTableItem::Group { children, .. } => children.len(),
+        }
+    }
+}
+
+fn split_field_group(display_name: &str) -> Option<(&str, &str)> {
+    let (group, child) = display_name.rsplit_once('.')?;
+    (!group.is_empty() && !child.is_empty()).then_some((group, child))
+}
+
+fn filtered_field_items<'a>(
+    evaluations: &'a [FieldEval],
     filter_query: &str,
     filter_errors_only: bool,
+) -> Vec<FieldTableItem<'a>> {
+    let mut items = Vec::new();
+
+    for eval in evaluations
+        .iter()
+        .filter(|eval| field_matches_filter(eval, filter_query, filter_errors_only))
+    {
+        if let Some((group_name, child_name)) = split_field_group(&eval.display_name) {
+            if let Some(FieldTableItem::Group { children, .. }) = items.iter_mut().find(|item| {
+                matches!(
+                    item,
+                    FieldTableItem::Group { name, .. } if name == group_name
+                )
+            }) {
+                children.push(FieldTableChild {
+                    name: child_name.to_string(),
+                    eval,
+                });
+            } else {
+                items.push(FieldTableItem::Group {
+                    name: group_name.to_string(),
+                    children: vec![FieldTableChild {
+                        name: child_name.to_string(),
+                        eval,
+                    }],
+                });
+            }
+        } else {
+            items.push(FieldTableItem::Ungrouped(eval));
+        }
+    }
+
+    items
+}
+
+fn field_item_count(items: &[FieldTableItem<'_>]) -> usize {
+    items.iter().map(FieldTableItem::field_count).sum()
+}
+
+fn draw_field_table(
+    ui: &mut egui::Ui,
+    items: &[FieldTableItem<'_>],
+    collapsed_groups: &mut HashSet<String>,
+    selected_range: Option<(u64, usize)>,
     available_width: f32,
 ) -> (Option<(String, u64, usize)>, Vec<egui::Rect>) {
     let mut clicked_field = None;
@@ -634,123 +773,221 @@ fn draw_field_table(
         - (spacing_x * 4.0))
         .max(320.0);
     let value_column_width = (flexible_width * 0.45).max(160.0);
-    let error_column_width = (flexible_width - value_column_width).max(160.0);
+    let widths = FieldTableWidths {
+        name: name_column_width,
+        offset: offset_column_width,
+        ty: type_column_width,
+        value: value_column_width,
+        error: (flexible_width - value_column_width).max(160.0),
+    };
 
     egui::Grid::new("field_evaluations")
         .striped(true)
         .show(ui, |ui| {
             ui.add_sized(
-                [name_column_width, ui.spacing().interact_size.y],
+                [widths.name, ui.spacing().interact_size.y],
                 egui::Label::new(egui::RichText::new("Name").strong()),
             );
             ui.add_sized(
-                [offset_column_width, ui.spacing().interact_size.y],
+                [widths.offset, ui.spacing().interact_size.y],
                 egui::Label::new(egui::RichText::new("Offset").strong()),
             );
             ui.add_sized(
-                [type_column_width, ui.spacing().interact_size.y],
+                [widths.ty, ui.spacing().interact_size.y],
                 egui::Label::new(egui::RichText::new("Type").strong()),
             );
             ui.add_sized(
-                [value_column_width, ui.spacing().interact_size.y],
+                [widths.value, ui.spacing().interact_size.y],
                 egui::Label::new(egui::RichText::new("Value").strong()),
             );
             ui.add_sized(
-                [error_column_width, ui.spacing().interact_size.y],
+                [widths.error, ui.spacing().interact_size.y],
                 egui::Label::new(egui::RichText::new("Error").strong()),
             );
             ui.end_row();
 
-            for eval in evaluations
-                .iter()
-                .filter(|eval| field_matches_filter(eval, filter_query, filter_errors_only))
-            {
-                let is_selected = selected_range
-                    .is_some_and(|selected| selected == (eval.resolved_offset, eval.byte_len));
-                let mut row_clicked = false;
+            for item in items {
+                match item {
+                    FieldTableItem::Ungrouped(eval) => {
+                        let (field, row_rect) = draw_field_eval_row(
+                            ui,
+                            eval,
+                            &eval.display_name,
+                            selected_range,
+                            &widths,
+                        );
+                        if let Some(field) = field {
+                            clicked_field = Some(field);
+                        }
+                        row_rects.push(row_rect);
+                    }
+                    FieldTableItem::Group { name, children } => {
+                        let collapsed = collapsed_groups.contains(name);
+                        let (group_clicked, row_rect) =
+                            draw_field_group_row(ui, name, collapsed, &widths);
+                        row_rects.push(row_rect);
 
-                let response = ui.add_sized(
-                    [name_column_width, ui.spacing().interact_size.y],
-                    egui::SelectableLabel::new(is_selected, &eval.display_name),
-                );
-                row_clicked |= response.clicked();
-                let mut row_rect = response.rect;
+                        let collapsed = if group_clicked {
+                            if !collapsed_groups.insert(name.clone()) {
+                                collapsed_groups.remove(name);
+                                false
+                            } else {
+                                true
+                            }
+                        } else {
+                            collapsed
+                        };
 
-                let response = ui.add_sized(
-                    [offset_column_width, ui.spacing().interact_size.y],
-                    egui::SelectableLabel::new(
-                        is_selected,
-                        egui::RichText::new(format_resolved_offset(
-                            eval.resolved_offset,
-                            eval.offset_valid,
-                        ))
-                        .monospace(),
-                    ),
-                );
-                row_clicked |= response.clicked();
-                row_rect = row_rect.union(response.rect);
-
-                let response = ui.add_sized(
-                    [type_column_width, ui.spacing().interact_size.y],
-                    egui::SelectableLabel::new(is_selected, format!("{:?}", eval.field.ty)),
-                );
-                row_clicked |= response.clicked();
-                row_rect = row_rect.union(response.rect);
-
-                if let Some(value) = &eval.value {
-                    let response = ui.add_sized(
-                        [value_column_width, ui.spacing().interact_size.y],
-                        egui::SelectableLabel::new(is_selected, format_value(value, eval.byte_len)),
-                    );
-                    row_clicked |= response.clicked();
-                    row_rect = row_rect.union(response.rect);
-                } else {
-                    let response = ui.add_sized(
-                        [value_column_width, ui.spacing().interact_size.y],
-                        egui::SelectableLabel::new(is_selected, "-"),
-                    );
-                    row_clicked |= response.clicked();
-                    row_rect = row_rect.union(response.rect);
+                        if !collapsed {
+                            for child in children {
+                                let (field, row_rect) = draw_field_eval_row(
+                                    ui,
+                                    child.eval,
+                                    &format!("    {}", child.name),
+                                    selected_range,
+                                    &widths,
+                                );
+                                if let Some(field) = field {
+                                    clicked_field = Some(field);
+                                }
+                                row_rects.push(row_rect);
+                            }
+                        }
+                    }
                 }
-
-                if let Some(error) = &eval.error {
-                    let response = ui.add_sized(
-                        [error_column_width, ui.spacing().interact_size.y],
-                        egui::SelectableLabel::new(
-                            is_selected,
-                            egui::RichText::new(error).color(ui.visuals().error_fg_color),
-                        ),
-                    );
-                    row_clicked |= response.clicked();
-                    row_rect = row_rect.union(response.rect);
-                } else {
-                    let response = ui.add_sized(
-                        [error_column_width, ui.spacing().interact_size.y],
-                        egui::SelectableLabel::new(is_selected, "-"),
-                    );
-                    row_clicked |= response.clicked();
-                    row_rect = row_rect.union(response.rect);
-                }
-
-                if row_clicked && eval.offset_valid {
-                    eprintln!(
-                        "field row clicked: name={} offset=0x{:X} len={}",
-                        eval.display_name, eval.resolved_offset, eval.byte_len
-                    );
-                    clicked_field = Some((
-                        eval.display_name.clone(),
-                        eval.resolved_offset,
-                        eval.byte_len,
-                    ));
-                }
-
-                row_rects.push(row_rect.expand2(egui::vec2(ui.spacing().item_spacing.x, 0.0)));
-
-                ui.end_row();
             }
         });
 
     (clicked_field, row_rects)
+}
+
+fn draw_field_group_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    collapsed: bool,
+    widths: &FieldTableWidths,
+) -> (bool, egui::Rect) {
+    let marker = if collapsed { "▶" } else { "▼" };
+    let mut row_clicked = false;
+    let response = ui.add_sized(
+        [widths.name, ui.spacing().interact_size.y],
+        egui::SelectableLabel::new(
+            false,
+            egui::RichText::new(format!("{marker} {name}")).strong(),
+        ),
+    );
+    row_clicked |= response.clicked();
+    let mut row_rect = response.rect;
+
+    for width in [widths.offset, widths.ty, widths.value, widths.error] {
+        let response = ui.add_sized(
+            [width, ui.spacing().interact_size.y],
+            egui::SelectableLabel::new(false, ""),
+        );
+        row_clicked |= response.clicked();
+        row_rect = row_rect.union(response.rect);
+    }
+
+    ui.end_row();
+    (
+        row_clicked,
+        row_rect.expand2(egui::vec2(ui.spacing().item_spacing.x, 0.0)),
+    )
+}
+
+fn draw_field_eval_row(
+    ui: &mut egui::Ui,
+    eval: &FieldEval,
+    display_name: &str,
+    selected_range: Option<(u64, usize)>,
+    widths: &FieldTableWidths,
+) -> (Option<(String, u64, usize)>, egui::Rect) {
+    let is_selected =
+        selected_range.is_some_and(|selected| selected == (eval.resolved_offset, eval.byte_len));
+    let mut row_clicked = false;
+
+    let response = ui.add_sized(
+        [widths.name, ui.spacing().interact_size.y],
+        egui::SelectableLabel::new(is_selected, display_name),
+    );
+    row_clicked |= response.clicked();
+    let mut row_rect = response.rect;
+
+    let response = ui.add_sized(
+        [widths.offset, ui.spacing().interact_size.y],
+        egui::SelectableLabel::new(
+            is_selected,
+            egui::RichText::new(format_resolved_offset(
+                eval.resolved_offset,
+                eval.offset_valid,
+            ))
+            .monospace(),
+        ),
+    );
+    row_clicked |= response.clicked();
+    row_rect = row_rect.union(response.rect);
+
+    let response = ui.add_sized(
+        [widths.ty, ui.spacing().interact_size.y],
+        egui::SelectableLabel::new(is_selected, format!("{:?}", eval.field.ty)),
+    );
+    row_clicked |= response.clicked();
+    row_rect = row_rect.union(response.rect);
+
+    if let Some(value) = &eval.value {
+        let response = ui.add_sized(
+            [widths.value, ui.spacing().interact_size.y],
+            egui::SelectableLabel::new(is_selected, format_value(value, eval.byte_len)),
+        );
+        row_clicked |= response.clicked();
+        row_rect = row_rect.union(response.rect);
+    } else {
+        let response = ui.add_sized(
+            [widths.value, ui.spacing().interact_size.y],
+            egui::SelectableLabel::new(is_selected, "-"),
+        );
+        row_clicked |= response.clicked();
+        row_rect = row_rect.union(response.rect);
+    }
+
+    if let Some(error) = &eval.error {
+        let response = ui.add_sized(
+            [widths.error, ui.spacing().interact_size.y],
+            egui::SelectableLabel::new(
+                is_selected,
+                egui::RichText::new(error).color(ui.visuals().error_fg_color),
+            ),
+        );
+        row_clicked |= response.clicked();
+        row_rect = row_rect.union(response.rect);
+    } else {
+        let response = ui.add_sized(
+            [widths.error, ui.spacing().interact_size.y],
+            egui::SelectableLabel::new(is_selected, "-"),
+        );
+        row_clicked |= response.clicked();
+        row_rect = row_rect.union(response.rect);
+    }
+
+    ui.end_row();
+    let row_rect = row_rect.expand2(egui::vec2(ui.spacing().item_spacing.x, 0.0));
+
+    if row_clicked && eval.offset_valid {
+        eprintln!(
+            "field row clicked: name={} offset=0x{:X} len={}",
+            eval.display_name, eval.resolved_offset, eval.byte_len
+        );
+        (
+            Some((
+                eval.display_name.clone(),
+                eval.resolved_offset,
+                eval.byte_len,
+            )),
+            row_rect,
+        )
+    } else {
+        (None, row_rect)
+    }
 }
 
 fn draw_field_filter_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Response {
@@ -1081,6 +1318,9 @@ fn draw_offset_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Response
 fn draw_search_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Response {
     ui.horizontal_wrapped(|ui| {
         ui.label("Search");
+        ui.radio_value(&mut doc.search_mode, SearchMode::Ascii, "ASCII");
+        ui.radio_value(&mut doc.search_mode, SearchMode::Hex, "Hex");
+
         let width = responsive_text_edit_width(ui, 240.0, 96.0);
         let _ = ui.add_sized(
             [width, ui.spacing().interact_size.y],
@@ -1118,7 +1358,8 @@ fn draw_search_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Response
 
         let has_search_state = !doc.search_query.is_empty()
             || !doc.active_search_query.is_empty()
-            || !doc.search_matches.is_empty();
+            || !doc.search_matches.is_empty()
+            || doc.search_error.is_some();
         if ui
             .add_enabled(has_search_state, egui::Button::new("Clear"))
             .clicked()
@@ -1128,6 +1369,9 @@ fn draw_search_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Response
 
         if let Some(status) = doc.search_status() {
             ui.label(status);
+        }
+        if let Some(error) = doc.search_error.as_deref() {
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
     })
     .response
@@ -1175,16 +1419,12 @@ fn draw_fields_pane(
         if evaluations.is_empty() {
             None
         } else {
-            let visible_count = evaluations
-                .iter()
-                .filter(|eval| {
-                    field_matches_filter(
-                        eval,
-                        &doc.field_filter_query,
-                        doc.field_filter_errors_only,
-                    )
-                })
-                .count();
+            let field_items = filtered_field_items(
+                evaluations,
+                &doc.field_filter_query,
+                doc.field_filter_errors_only,
+            );
+            let visible_count = field_item_count(&field_items);
             protected_rects.push(
                 ui.label(format!(
                     "Showing {visible_count} / {} fields",
@@ -1212,10 +1452,9 @@ fn draw_fields_pane(
                     ui.set_width(table_width);
                     draw_field_table(
                         ui,
-                        evaluations,
+                        &field_items,
+                        &mut doc.collapsed_field_groups,
                         doc.selected_field_range,
-                        &doc.field_filter_query,
-                        doc.field_filter_errors_only,
                         table_width,
                     )
                 });
@@ -1395,11 +1634,15 @@ mod tests {
             selected_field_range: None,
             selected_field_name: None,
             search_query: String::new(),
+            search_mode: SearchMode::Ascii,
             active_search_query: String::new(),
+            active_search_pattern_len: 0,
             search_matches: Vec::new(),
             current_search_match: None,
+            search_error: None,
             field_filter_query: String::new(),
             field_filter_errors_only: false,
+            collapsed_field_groups: HashSet::new(),
         }
     }
 
@@ -1434,6 +1677,24 @@ mod tests {
             .filter(|eval| field_matches_filter(eval, query, errors_only))
             .map(|eval| eval.display_name.as_str())
             .collect()
+    }
+
+    fn field_item_labels(items: &[FieldTableItem<'_>]) -> Vec<String> {
+        let mut labels = Vec::new();
+
+        for item in items {
+            match item {
+                FieldTableItem::Ungrouped(eval) => {
+                    labels.push(format!("field:{}", eval.display_name));
+                }
+                FieldTableItem::Group { name, children } => {
+                    labels.push(format!("group:{name}"));
+                    labels.extend(children.iter().map(|child| format!("child:{}", child.name)));
+                }
+            }
+        }
+
+        labels
     }
 
     #[test]
@@ -1507,57 +1768,183 @@ mod tests {
     }
 
     #[test]
-    fn ascii_search_finds_exact_matches() {
+    fn field_group_split_uses_final_dot() {
+        assert_eq!(split_field_group("header.magic"), Some(("header", "magic")));
+        assert_eq!(
+            split_field_group("packet.header.magic"),
+            Some(("packet.header", "magic"))
+        );
+        assert_eq!(
+            split_field_group("records[0].id"),
+            Some(("records[0]", "id"))
+        );
+        assert_eq!(split_field_group("payload"), None);
+    }
+
+    #[test]
+    fn filtered_field_items_group_dotted_names() {
+        let evaluations = vec![
+            field_eval("header.magic", None),
+            field_eval("header.length", None),
+            field_eval("records[0].id", None),
+            field_eval("records[0].value", None),
+            field_eval("payload", None),
+        ];
+
+        let items = filtered_field_items(&evaluations, "", false);
+
+        assert_eq!(
+            field_item_labels(&items),
+            vec![
+                "group:header",
+                "child:magic",
+                "child:length",
+                "group:records[0]",
+                "child:id",
+                "child:value",
+                "field:payload",
+            ]
+        );
+        assert_eq!(field_item_count(&items), 5);
+    }
+
+    #[test]
+    fn filtered_field_items_filter_by_group_or_child_name() {
+        let evaluations = vec![
+            field_eval("header.magic", None),
+            field_eval("header.length", None),
+            field_eval("records[0].id", None),
+            field_eval("payload", None),
+        ];
+
+        let group_items = filtered_field_items(&evaluations, "header", false);
+        assert_eq!(
+            field_item_labels(&group_items),
+            vec!["group:header", "child:magic", "child:length"]
+        );
+        assert_eq!(field_item_count(&group_items), 2);
+
+        let child_items = filtered_field_items(&evaluations, "magic", false);
+        assert_eq!(
+            field_item_labels(&child_items),
+            vec!["group:header", "child:magic"]
+        );
+        assert_eq!(field_item_count(&child_items), 1);
+    }
+
+    #[test]
+    fn filtered_field_items_errors_only_omits_empty_groups() {
+        let evaluations = vec![
+            field_eval("header.magic", None),
+            field_eval("header.length", Some("short read")),
+            field_eval("records[0].id", None),
+            field_eval("payload", Some("invalid offset")),
+        ];
+
+        let items = filtered_field_items(&evaluations, "", true);
+
+        assert_eq!(
+            field_item_labels(&items),
+            vec!["group:header", "child:length", "field:payload"]
+        );
+        assert_eq!(field_item_count(&items), 2);
+    }
+
+    #[test]
+    fn parse_hex_pattern_accepts_spaced_bytes() {
+        assert_eq!(
+            parse_hex_pattern("DE AD BE EF").unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+    }
+
+    #[test]
+    fn parse_hex_pattern_accepts_compact_bytes() {
+        assert_eq!(
+            parse_hex_pattern("deadbeef").unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+    }
+
+    #[test]
+    fn parse_hex_pattern_accepts_mixed_case_and_extra_whitespace() {
+        assert_eq!(
+            parse_hex_pattern("  De AD  be EF  ").unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+    }
+
+    #[test]
+    fn parse_hex_pattern_rejects_odd_digit_count() {
+        let err = parse_hex_pattern("ABC").unwrap_err();
+
+        assert!(err.contains("even number"));
+    }
+
+    #[test]
+    fn parse_hex_pattern_rejects_invalid_characters() {
+        let err = parse_hex_pattern("DE AD ZQ").unwrap_err();
+
+        assert!(err.contains("unexpected character"));
+    }
+
+    #[test]
+    fn parse_hex_pattern_empty_input_is_empty() {
+        assert_eq!(parse_hex_pattern("  ").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn byte_pattern_search_finds_exact_matches() {
         let buffer = MemoryBuffer::from_vec(b"abc BIN def BIN".to_vec());
 
-        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"BIN").unwrap();
+        let matches = find_byte_pattern_matches(&buffer, buffer.file_size(), b"BIN").unwrap();
 
         assert_eq!(matches, vec![4, 12]);
     }
 
     #[test]
-    fn ascii_search_finds_overlapping_matches() {
+    fn byte_pattern_search_finds_overlapping_matches() {
         let buffer = MemoryBuffer::from_vec(b"AAAA".to_vec());
 
-        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"AA").unwrap();
+        let matches = find_byte_pattern_matches(&buffer, buffer.file_size(), b"AA").unwrap();
 
         assert_eq!(matches, vec![0, 1, 2]);
     }
 
     #[test]
-    fn ascii_search_reports_no_matches() {
+    fn byte_pattern_search_reports_no_matches() {
         let buffer = MemoryBuffer::from_vec(b"BINOCULAR".to_vec());
 
-        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"HELLO").unwrap();
+        let matches = find_byte_pattern_matches(&buffer, buffer.file_size(), b"HELLO").unwrap();
 
         assert!(matches.is_empty());
     }
 
     #[test]
-    fn ascii_search_empty_query_is_empty() {
+    fn byte_pattern_search_empty_pattern_is_empty() {
         let buffer = MemoryBuffer::from_vec(b"BINOCULAR".to_vec());
 
-        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"").unwrap();
+        let matches = find_byte_pattern_matches(&buffer, buffer.file_size(), b"").unwrap();
 
         assert!(matches.is_empty());
     }
 
     #[test]
-    fn ascii_search_is_case_sensitive() {
+    fn byte_pattern_search_is_case_sensitive_for_ascii_bytes() {
         let buffer = MemoryBuffer::from_vec(b"bin BIN".to_vec());
 
-        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"BIN").unwrap();
+        let matches = find_byte_pattern_matches(&buffer, buffer.file_size(), b"BIN").unwrap();
 
         assert_eq!(matches, vec![4]);
     }
 
     #[test]
-    fn ascii_search_finds_match_crossing_chunk_boundary() {
+    fn byte_pattern_search_finds_match_crossing_chunk_boundary() {
         let mut bytes = vec![b'.'; SEARCH_CHUNK_SIZE + 8];
         bytes[SEARCH_CHUNK_SIZE - 2..SEARCH_CHUNK_SIZE + 3].copy_from_slice(b"HELLO");
         let buffer = MemoryBuffer::from_vec(bytes);
 
-        let matches = find_ascii_matches(&buffer, buffer.file_size(), b"HELLO").unwrap();
+        let matches = find_byte_pattern_matches(&buffer, buffer.file_size(), b"HELLO").unwrap();
 
         assert_eq!(matches, vec![(SEARCH_CHUNK_SIZE - 2) as u64]);
     }
@@ -1576,6 +1963,8 @@ mod tests {
         assert_eq!(doc.search_matches, vec![4]);
         assert_eq!(doc.current_search_match, Some(0));
         assert_eq!(doc.active_search_query, "HELLO");
+        assert_eq!(doc.active_search_pattern_len, 5);
+        assert_eq!(doc.search_error, None);
     }
 
     #[test]
@@ -1588,6 +1977,72 @@ mod tests {
 
         assert_eq!(doc.search_matches, vec![0, 10]);
         assert_eq!(doc.active_search_query, "BIN");
+        assert_eq!(doc.active_search_pattern_len, 3);
         assert_eq!(doc.search_status().as_deref(), Some("Match 1 of 2"));
+    }
+
+    #[test]
+    fn document_hex_search_finds_byte_patterns() {
+        let mut doc = memory_doc(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
+        doc.search_mode = SearchMode::Hex;
+        doc.search_query = "DE AD BE EF".to_string();
+
+        doc.find_search_matches().unwrap();
+
+        assert_eq!(doc.search_matches, vec![0, 5]);
+        assert_eq!(doc.current_search_match, Some(0));
+        assert_eq!(doc.active_search_query, "DE AD BE EF");
+        assert_eq!(doc.active_search_pattern_len, 4);
+        assert_eq!(doc.search_error, None);
+    }
+
+    #[test]
+    fn document_hex_search_compact_query_uses_byte_length_for_highlights() {
+        let mut doc = memory_doc(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        doc.search_mode = SearchMode::Hex;
+        doc.search_query = "deadbeef".to_string();
+
+        doc.find_search_matches().unwrap();
+
+        assert_eq!(doc.search_matches, vec![0]);
+        assert_eq!(doc.active_search_pattern_len, 4);
+        assert_eq!(doc.search_status().as_deref(), Some("Match 1 of 1"));
+    }
+
+    #[test]
+    fn document_hex_search_reports_no_matches() {
+        let mut doc = memory_doc(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        doc.search_mode = SearchMode::Hex;
+        doc.search_query = "FF".to_string();
+
+        doc.find_search_matches().unwrap();
+
+        assert!(doc.search_matches.is_empty());
+        assert_eq!(doc.current_search_match, None);
+        assert_eq!(doc.active_search_pattern_len, 1);
+        assert_eq!(doc.search_status().as_deref(), Some("No matches"));
+        assert_eq!(doc.search_error, None);
+    }
+
+    #[test]
+    fn document_invalid_hex_search_clears_stale_results() {
+        let mut doc = memory_doc(b"BIN HELLO BIN");
+        doc.search_query = "BIN".to_string();
+        doc.find_search_matches().unwrap();
+        assert_eq!(doc.search_matches, vec![0, 10]);
+
+        doc.search_mode = SearchMode::Hex;
+        doc.search_query = "DE AD ZQ".to_string();
+        doc.find_search_matches().unwrap();
+
+        assert!(doc.search_matches.is_empty());
+        assert_eq!(doc.current_search_match, None);
+        assert_eq!(doc.active_search_query, "");
+        assert_eq!(doc.active_search_pattern_len, 0);
+        assert_eq!(doc.search_status(), None);
+        assert!(doc
+            .search_error
+            .as_deref()
+            .is_some_and(|error| error.contains("unexpected character")));
     }
 }
