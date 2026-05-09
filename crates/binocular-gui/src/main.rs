@@ -8,6 +8,8 @@ use eframe::egui;
 
 const HEX_PAGE_SIZE: usize = 1024;
 const HEX_VIEW_HEIGHT: f32 = 300.0;
+const SIDE_BY_SIDE_MIN_WIDTH: f32 = 760.0;
+const HEX_PANE_WIDTH_FRACTION: f32 = 0.60;
 const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DISPLAY_BYTES: usize = 256;
 const SEARCH_CHUNK_SIZE: usize = 64 * 1024;
@@ -632,6 +634,306 @@ fn draw_field_table(
     (clicked_field, row_rects)
 }
 
+fn draw_document_view(ui: &mut egui::Ui, doc: &mut Document) {
+    let panel_rect = ui.max_rect();
+    let mut protected_rects = Vec::new();
+
+    if ui.available_width() >= SIDE_BY_SIDE_MIN_WIDTH {
+        draw_side_by_side_document_view(ui, doc, &mut protected_rects);
+    } else {
+        draw_stacked_document_view(ui, doc, &mut protected_rects);
+    }
+
+    if clicked_outside_regions(ui, panel_rect, &protected_rects) {
+        doc.clear_selected_field();
+    }
+}
+
+fn draw_side_by_side_document_view(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    protected_rects: &mut Vec<egui::Rect>,
+) {
+    let available_width = ui.available_width();
+    let pane_gap = ui.spacing().item_spacing.x;
+    let pane_height = ui.available_height();
+    let left_width = ((available_width - pane_gap) * HEX_PANE_WIDTH_FRACTION).max(0.0);
+    let right_width = (available_width - pane_gap - left_width).max(0.0);
+
+    // TODO: This is the future insertion point for a schema/YAML investigation pane.
+    ui.horizontal(|ui| {
+        let mut hex_view_top = None;
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(left_width, pane_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(left_width);
+                hex_view_top = Some(draw_hex_pane(ui, doc, protected_rects, true).top());
+            },
+        );
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(right_width, pane_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(right_width);
+                if let Some(hex_view_top) = hex_view_top {
+                    let spacer_height = hex_view_top - ui.cursor().top();
+                    if spacer_height > 0.0 {
+                        ui.add_space(spacer_height);
+                    }
+                }
+                draw_fields_pane(ui, doc, protected_rects);
+            },
+        );
+    });
+}
+
+fn draw_stacked_document_view(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    protected_rects: &mut Vec<egui::Rect>,
+) {
+    draw_hex_pane(ui, doc, protected_rects, false);
+
+    if doc.schema.is_some() {
+        ui.separator();
+        draw_fields_pane(ui, doc, protected_rects);
+    }
+}
+
+fn draw_hex_pane(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    protected_rects: &mut Vec<egui::Rect>,
+    fill_available_height: bool,
+) -> egui::Rect {
+    protected_rects.push(ui.heading(&doc.name).rect);
+    protected_rects.push(ui.label(format!("Size: {}", format_size(doc.size))).rect);
+
+    if let Some(error) = doc.last_error.as_deref() {
+        let error_text = error.to_owned();
+        let response = ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                egui::RichText::new(&error_text).strong(),
+            );
+            if ui.button("Dismiss").clicked() {
+                doc.last_error = None;
+                doc.last_error_is_offset = false;
+            }
+        });
+        protected_rects.push(response.response.rect);
+        ui.add_space(4.0);
+    }
+
+    protected_rects.push(draw_offset_controls(ui, doc).rect);
+    protected_rects.push(draw_search_controls(ui, doc).rect);
+
+    ui.separator();
+    if let (Some(name), Some((offset, len))) =
+        (doc.selected_field_name.as_deref(), doc.selected_field_range)
+    {
+        protected_rects.push(
+            ui.label(format!("Selected: {name} @ 0x{offset:08X} (len {len})"))
+                .rect,
+        );
+    }
+
+    let max_height = if fill_available_height {
+        ui.available_height().max(HEX_VIEW_HEIGHT)
+    } else {
+        HEX_VIEW_HEIGHT
+    };
+
+    let hex_output = egui::ScrollArea::both()
+        .id_source("hex_view_scroll_area")
+        .max_height(max_height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            draw_hex_view(ui, doc);
+        });
+    protected_rects.push(hex_output.inner_rect.expand(4.0));
+    hex_output.inner_rect
+}
+
+fn draw_offset_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Response {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Go to offset:");
+        let width = responsive_text_edit_width(ui, 160.0, 72.0);
+        let _ = ui.add_sized(
+            [width, ui.spacing().interact_size.y],
+            egui::TextEdit::singleline(&mut doc.hex_offset_input),
+        );
+
+        if ui.button("Go").clicked() {
+            let input = doc.hex_offset_input.trim();
+            let parsed_offset = if let Some(hex) = input
+                .strip_prefix("0x")
+                .or_else(|| input.strip_prefix("0X"))
+            {
+                u64::from_str_radix(hex, 16)
+            } else {
+                input.parse::<u64>()
+            };
+
+            match parsed_offset {
+                Ok(offset) => {
+                    let max_start = doc.size.saturating_sub(HEX_PAGE_SIZE as u64);
+                    let clamped = offset.min(max_start);
+                    doc.hex_start_offset = clamped;
+                    doc.hex_offset_input = format!("0x{:X}", clamped);
+                    if doc.last_error_is_offset {
+                        doc.last_error = None;
+                        doc.last_error_is_offset = false;
+                    }
+                }
+                Err(_) => {
+                    doc.last_error =
+                        Some(format!("Invalid offset: {}", doc.hex_offset_input.trim()));
+                    doc.last_error_is_offset = true;
+                }
+            }
+        }
+
+        let max_start = doc.size.saturating_sub(HEX_PAGE_SIZE as u64);
+        if ui
+            .add_enabled(doc.hex_start_offset > 0, egui::Button::new("Previous page"))
+            .clicked()
+        {
+            let new_offset = doc.hex_start_offset.saturating_sub(HEX_PAGE_SIZE as u64);
+            doc.hex_start_offset = new_offset;
+            doc.hex_offset_input = format!("0x{:X}", new_offset);
+            if doc.last_error_is_offset {
+                doc.last_error = None;
+                doc.last_error_is_offset = false;
+            }
+        }
+
+        if ui
+            .add_enabled(
+                doc.hex_start_offset < max_start,
+                egui::Button::new("Next page"),
+            )
+            .clicked()
+        {
+            let new_offset = doc
+                .hex_start_offset
+                .saturating_add(HEX_PAGE_SIZE as u64)
+                .min(max_start);
+            doc.hex_start_offset = new_offset;
+            doc.hex_offset_input = format!("0x{:X}", new_offset);
+            if doc.last_error_is_offset {
+                doc.last_error = None;
+                doc.last_error_is_offset = false;
+            }
+        }
+    })
+    .response
+}
+
+fn draw_search_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Response {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Search");
+        let width = responsive_text_edit_width(ui, 240.0, 96.0);
+        let _ = ui.add_sized(
+            [width, ui.spacing().interact_size.y],
+            egui::TextEdit::singleline(&mut doc.search_query),
+        );
+
+        if ui.button("Find").clicked() {
+            match doc.find_search_matches() {
+                Ok(()) => {
+                    if doc.last_error_is_offset {
+                        doc.last_error = None;
+                        doc.last_error_is_offset = false;
+                    }
+                }
+                Err(err) => {
+                    doc.last_error = Some(format!("Search failed: {err}"));
+                    doc.last_error_is_offset = false;
+                }
+            }
+        }
+
+        let has_matches = !doc.search_matches.is_empty();
+        if ui
+            .add_enabled(has_matches, egui::Button::new("Prev"))
+            .clicked()
+        {
+            doc.previous_search_match();
+        }
+        if ui
+            .add_enabled(has_matches, egui::Button::new("Next"))
+            .clicked()
+        {
+            doc.next_search_match();
+        }
+
+        let has_search_state = !doc.search_query.is_empty()
+            || !doc.active_search_query.is_empty()
+            || !doc.search_matches.is_empty();
+        if ui
+            .add_enabled(has_search_state, egui::Button::new("Clear"))
+            .clicked()
+        {
+            doc.clear_search();
+        }
+
+        if let Some(status) = doc.search_status() {
+            ui.label(status);
+        }
+    })
+    .response
+}
+
+fn draw_fields_pane(ui: &mut egui::Ui, doc: &mut Document, protected_rects: &mut Vec<egui::Rect>) {
+    if doc.schema.is_none() {
+        return;
+    }
+
+    protected_rects.push(ui.heading("Interpreted Fields").rect);
+
+    if let Some(schema) = doc.schema.as_ref() {
+        let mut schema_label = format!(
+            "Schema: {} (v{})",
+            schema.schema_name, schema.schema_version
+        );
+
+        if let Some(schema_path) = doc.schema_path.as_ref() {
+            if let Some(file_name) = schema_path.file_name() {
+                schema_label.push_str(&format!(" - {}", file_name.to_string_lossy()));
+            }
+        }
+
+        protected_rects.push(ui.label(schema_label).rect);
+    }
+
+    let clicked_field = if let Some(evaluations) = doc.field_evaluations.as_ref() {
+        if evaluations.is_empty() {
+            None
+        } else {
+            let max_height = ui.available_height().max(120.0);
+            let table_output = egui::ScrollArea::both()
+                .id_source("field_table_scroll_area")
+                .max_height(max_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    draw_field_table(ui, evaluations, doc.selected_field_range)
+                });
+            protected_rects.extend(table_output.inner.1);
+            table_output.inner.0
+        }
+    } else {
+        None
+    };
+
+    if let Some((name, offset, byte_len)) = clicked_field {
+        doc.select_field(name, offset, byte_len);
+    }
+}
+
 impl eframe::App for BinOcularApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -667,219 +969,7 @@ impl eframe::App for BinOcularApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(index) = self.current_doc {
                 if let Some(doc) = self.documents.get_mut(index) {
-                    let panel_rect = ui.max_rect();
-                    let mut protected_rects = Vec::new();
-
-                    protected_rects.push(ui.heading(&doc.name).rect);
-                    protected_rects.push(ui.label(format!("Size: {}", format_size(doc.size))).rect);
-
-                    if let Some(error) = doc.last_error.as_deref() {
-                        let error_text = error.to_owned();
-                        let response = ui.horizontal_wrapped(|ui| {
-                            ui.colored_label(
-                                ui.visuals().error_fg_color,
-                                egui::RichText::new(&error_text).strong(),
-                            );
-                            if ui.button("Dismiss").clicked() {
-                                doc.last_error = None;
-                                doc.last_error_is_offset = false;
-                            }
-                        });
-                        protected_rects.push(response.response.rect);
-                        ui.add_space(4.0);
-                    }
-
-                    let offset_controls = ui.horizontal_wrapped(|ui| {
-                        ui.label("Go to offset:");
-                        let width = responsive_text_edit_width(ui, 160.0, 72.0);
-                        let _ = ui.add_sized(
-                            [width, ui.spacing().interact_size.y],
-                            egui::TextEdit::singleline(&mut doc.hex_offset_input),
-                        );
-
-                        if ui.button("Go").clicked() {
-                            let input = doc.hex_offset_input.trim();
-                            let parsed_offset = if let Some(hex) = input
-                                .strip_prefix("0x")
-                                .or_else(|| input.strip_prefix("0X"))
-                            {
-                                u64::from_str_radix(hex, 16)
-                            } else {
-                                input.parse::<u64>()
-                            };
-
-                            match parsed_offset {
-                                Ok(offset) => {
-                                    let max_start = doc.size.saturating_sub(HEX_PAGE_SIZE as u64);
-                                    let clamped = offset.min(max_start);
-                                    doc.hex_start_offset = clamped;
-                                    doc.hex_offset_input = format!("0x{:X}", clamped);
-                                    if doc.last_error_is_offset {
-                                        doc.last_error = None;
-                                        doc.last_error_is_offset = false;
-                                    }
-                                }
-                                Err(_) => {
-                                    doc.last_error = Some(format!(
-                                        "Invalid offset: {}",
-                                        doc.hex_offset_input.trim()
-                                    ));
-                                    doc.last_error_is_offset = true;
-                                }
-                            }
-                        }
-
-                        let max_start = doc.size.saturating_sub(HEX_PAGE_SIZE as u64);
-                        if ui
-                            .add_enabled(
-                                doc.hex_start_offset > 0,
-                                egui::Button::new("Previous page"),
-                            )
-                            .clicked()
-                        {
-                            let new_offset =
-                                doc.hex_start_offset.saturating_sub(HEX_PAGE_SIZE as u64);
-                            doc.hex_start_offset = new_offset;
-                            doc.hex_offset_input = format!("0x{:X}", new_offset);
-                            if doc.last_error_is_offset {
-                                doc.last_error = None;
-                                doc.last_error_is_offset = false;
-                            }
-                        }
-
-                        if ui
-                            .add_enabled(
-                                doc.hex_start_offset < max_start,
-                                egui::Button::new("Next page"),
-                            )
-                            .clicked()
-                        {
-                            let new_offset = doc
-                                .hex_start_offset
-                                .saturating_add(HEX_PAGE_SIZE as u64)
-                                .min(max_start);
-                            doc.hex_start_offset = new_offset;
-                            doc.hex_offset_input = format!("0x{:X}", new_offset);
-                            if doc.last_error_is_offset {
-                                doc.last_error = None;
-                                doc.last_error_is_offset = false;
-                            }
-                        }
-                    });
-                    protected_rects.push(offset_controls.response.rect);
-
-                    let search_controls = ui.horizontal_wrapped(|ui| {
-                        ui.label("Search");
-                        let width = responsive_text_edit_width(ui, 240.0, 96.0);
-                        let _ = ui.add_sized(
-                            [width, ui.spacing().interact_size.y],
-                            egui::TextEdit::singleline(&mut doc.search_query),
-                        );
-
-                        if ui.button("Find").clicked() {
-                            match doc.find_search_matches() {
-                                Ok(()) => {
-                                    if doc.last_error_is_offset {
-                                        doc.last_error = None;
-                                        doc.last_error_is_offset = false;
-                                    }
-                                }
-                                Err(err) => {
-                                    doc.last_error = Some(format!("Search failed: {err}"));
-                                    doc.last_error_is_offset = false;
-                                }
-                            }
-                        }
-
-                        let has_matches = !doc.search_matches.is_empty();
-                        if ui
-                            .add_enabled(has_matches, egui::Button::new("Prev"))
-                            .clicked()
-                        {
-                            doc.previous_search_match();
-                        }
-                        if ui
-                            .add_enabled(has_matches, egui::Button::new("Next"))
-                            .clicked()
-                        {
-                            doc.next_search_match();
-                        }
-
-                        let has_search_state = !doc.search_query.is_empty()
-                            || !doc.active_search_query.is_empty()
-                            || !doc.search_matches.is_empty();
-                        if ui
-                            .add_enabled(has_search_state, egui::Button::new("Clear"))
-                            .clicked()
-                        {
-                            doc.clear_search();
-                        }
-
-                        if let Some(status) = doc.search_status() {
-                            ui.label(status);
-                        }
-                    });
-                    protected_rects.push(search_controls.response.rect);
-
-                    ui.separator();
-                    if let (Some(name), Some((offset, len))) =
-                        (doc.selected_field_name.as_deref(), doc.selected_field_range)
-                    {
-                        protected_rects.push(
-                            ui.label(format!("Selected: {name} @ 0x{offset:08X} (len {len})"))
-                                .rect,
-                        );
-                    }
-                    let hex_output = egui::ScrollArea::both()
-                        .id_source("hex_view_scroll_area")
-                        .max_height(HEX_VIEW_HEIGHT)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            draw_hex_view(ui, doc);
-                        });
-                    protected_rects.push(hex_output.inner_rect.expand(4.0));
-
-                    if doc.schema.is_some() {
-                        ui.separator();
-                        protected_rects.push(ui.heading("Interpreted Fields").rect);
-
-                        if let Some(schema) = doc.schema.as_ref() {
-                            let mut schema_label = format!(
-                                "Schema: {} (v{})",
-                                schema.schema_name, schema.schema_version
-                            );
-
-                            if let Some(schema_path) = doc.schema_path.as_ref() {
-                                if let Some(file_name) = schema_path.file_name() {
-                                    schema_label
-                                        .push_str(&format!(" — {}", file_name.to_string_lossy()));
-                                }
-                            }
-
-                            protected_rects.push(ui.label(schema_label).rect);
-                        }
-
-                        if let Some(evaluations) = doc.field_evaluations.as_ref() {
-                            if !evaluations.is_empty() {
-                                let table_output = egui::ScrollArea::horizontal()
-                                    .id_source("field_table_scroll_area")
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        draw_field_table(ui, evaluations, doc.selected_field_range)
-                                    });
-                                protected_rects.extend(table_output.inner.1);
-
-                                if let Some((name, offset, byte_len)) = table_output.inner.0 {
-                                    doc.select_field(name, offset, byte_len);
-                                }
-                            }
-                        }
-                    }
-
-                    if clicked_outside_regions(ui, panel_rect, &protected_rects) {
-                        doc.clear_selected_field();
-                    }
-
+                    draw_document_view(ui, doc);
                     return;
                 }
             }
