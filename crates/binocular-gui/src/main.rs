@@ -3,7 +3,7 @@ use std::{collections::HashSet, fs, path::PathBuf, sync::Arc};
 use binocular_core::buffer::{FileBuffer, MemoryBuffer, MmapBuffer};
 use binocular_core::interpret::{interpret_schema, FieldEval, FieldValue};
 use binocular_schema::ast::Schema;
-use binocular_schema::parser::parse_schema_file;
+use binocular_schema::parser::parse_schema_str_with_base_path;
 use eframe::egui;
 
 const HEX_PAGE_SIZE: usize = 1024;
@@ -36,7 +36,9 @@ struct Document {
     last_error: Option<String>,
     last_error_is_offset: bool,
     schema_path: Option<PathBuf>,
-    schema_source_text: Option<String>,
+    schema_editor_text: String,
+    schema_editor_dirty: bool,
+    schema_editor_error: Option<String>,
     hex_start_offset: u64,
     hex_offset_input: String,
     selected_field_range: Option<(u64, usize)>,
@@ -100,15 +102,6 @@ impl BinOcularApp {
             return;
         };
 
-        let schema = match parse_schema_file(&path) {
-            Ok(schema) => schema,
-            Err(err) => {
-                doc.last_error = Some(format!("Failed to parse or validate schema: {err}"));
-                doc.last_error_is_offset = false;
-                return;
-            }
-        };
-
         let schema_source_text = match fs::read_to_string(&path) {
             Ok(source_text) => source_text,
             Err(err) => {
@@ -118,14 +111,18 @@ impl BinOcularApp {
             }
         };
 
-        let evaluations = interpret_schema(doc.buffer.as_ref(), &schema);
-        doc.schema = Some(schema);
-        doc.field_evaluations = Some(evaluations);
+        let schema = match parse_schema_str_with_base_path(&schema_source_text, &path) {
+            Ok(schema) => schema,
+            Err(err) => {
+                doc.last_error = Some(format!("Failed to parse or validate schema: {err}"));
+                doc.last_error_is_offset = false;
+                return;
+            }
+        };
+
         doc.schema_path = Some(path);
-        doc.schema_source_text = Some(schema_source_text);
-        doc.last_error = None;
-        doc.last_error_is_offset = false;
-        doc.clear_selected_field();
+        doc.schema_editor_text = schema_source_text;
+        doc.commit_schema(schema);
     }
 
     fn load_document_from_path(path: PathBuf) -> Result<Document, String> {
@@ -157,7 +154,9 @@ impl BinOcularApp {
             last_error: None,
             last_error_is_offset: false,
             schema_path: None,
-            schema_source_text: None,
+            schema_editor_text: String::new(),
+            schema_editor_dirty: false,
+            schema_editor_error: None,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
@@ -184,41 +183,72 @@ impl BinOcularApp {
             return;
         };
 
-        let Some(schema_path) = doc.schema_path.clone() else {
-            doc.last_error = Some("No schema loaded to reload".to_string());
-            doc.last_error_is_offset = false;
+        doc.reload_schema_from_disk();
+    }
+}
+
+impl Document {
+    fn commit_schema(&mut self, schema: Schema) {
+        let evaluations = interpret_schema(self.buffer.as_ref(), &schema);
+        self.schema = Some(schema);
+        self.field_evaluations = Some(evaluations);
+        self.schema_editor_dirty = false;
+        self.schema_editor_error = None;
+        self.last_error = None;
+        self.last_error_is_offset = false;
+        self.clear_selected_field();
+    }
+
+    fn apply_schema_editor(&mut self) {
+        let Some(schema_path) = self.schema_path.clone() else {
+            self.schema_editor_error =
+                Some("No schema path available for Apply Schema".to_string());
             return;
         };
 
-        let schema = match parse_schema_file(&schema_path) {
-            Ok(schema) => schema,
+        match parse_schema_str_with_base_path(&self.schema_editor_text, &schema_path) {
+            Ok(schema) => self.commit_schema(schema),
             Err(err) => {
-                doc.last_error = Some(format!("Failed to parse or validate schema: {err}"));
-                doc.last_error_is_offset = false;
-                return;
+                self.schema_editor_error =
+                    Some(format!("Failed to parse or validate schema: {err}"));
+                self.schema_editor_dirty = true;
             }
+        }
+    }
+
+    fn reload_schema_from_disk(&mut self) {
+        let Some(schema_path) = self.schema_path.clone() else {
+            self.schema_editor_error = Some("No schema loaded to reload".to_string());
+            return;
         };
 
         let schema_source_text = match fs::read_to_string(&schema_path) {
             Ok(source_text) => source_text,
             Err(err) => {
-                doc.last_error = Some(format!("Failed to read schema source: {err}"));
-                doc.last_error_is_offset = false;
+                let error = format!("Failed to read schema source: {err}");
+                self.schema_editor_error = Some(error.clone());
+                self.last_error = Some(error);
+                self.last_error_is_offset = false;
                 return;
             }
         };
 
-        let evaluations = interpret_schema(doc.buffer.as_ref(), &schema);
-        doc.schema = Some(schema);
-        doc.field_evaluations = Some(evaluations);
-        doc.schema_source_text = Some(schema_source_text);
-        doc.last_error = None;
-        doc.last_error_is_offset = false;
-        doc.clear_selected_field();
+        match parse_schema_str_with_base_path(&schema_source_text, &schema_path) {
+            Ok(schema) => {
+                self.schema_editor_text = schema_source_text;
+                self.commit_schema(schema);
+            }
+            Err(err) => {
+                let error = format!("Failed to parse or validate schema: {err}");
+                self.schema_editor_text = schema_source_text;
+                self.schema_editor_dirty = false;
+                self.schema_editor_error = Some(error.clone());
+                self.last_error = Some(error);
+                self.last_error_is_offset = false;
+            }
+        }
     }
-}
 
-impl Document {
     fn read_bytes(&self, offset: u64, len: usize) -> Option<&[u8]> {
         self.buffer.read_bytes(offset, len).ok()
     }
@@ -1473,7 +1503,7 @@ fn draw_fields_pane(
 
 fn draw_schema_pane(
     ui: &mut egui::Ui,
-    doc: &Document,
+    doc: &mut Document,
     protected_rects: &mut Vec<egui::Rect>,
     fill_available_height: bool,
 ) {
@@ -1496,7 +1526,42 @@ fn draw_schema_pane(
         protected_rects.push(ui.label(label).rect);
     }
 
-    if let Some(source_text) = doc.schema_source_text.as_ref() {
+    let controls_response = ui.horizontal_wrapped(|ui| {
+        let can_apply = doc.schema_path.is_some() && !doc.schema_editor_text.trim().is_empty();
+        if ui
+            .add_enabled(can_apply, egui::Button::new("Apply Schema"))
+            .clicked()
+        {
+            doc.apply_schema_editor();
+        }
+
+        if ui
+            .add_enabled(
+                doc.schema_path.is_some(),
+                egui::Button::new("Reload from Disk"),
+            )
+            .clicked()
+        {
+            doc.reload_schema_from_disk();
+        }
+
+        if doc.schema_editor_dirty {
+            ui.label("modified");
+        }
+    });
+    protected_rects.push(controls_response.response.rect);
+
+    if let Some(error) = doc.schema_editor_error.as_deref() {
+        protected_rects.push(
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                egui::RichText::new(error).strong(),
+            )
+            .rect,
+        );
+    }
+
+    if !doc.schema_editor_text.is_empty() || doc.schema_path.is_some() {
         let max_height = if fill_available_height {
             ui.available_height().max(120.0)
         } else {
@@ -1512,7 +1577,15 @@ fn draw_schema_pane(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_width(source_width);
-                ui.monospace(source_text.as_str());
+                let response = ui.add_sized(
+                    [source_width, max_height],
+                    egui::TextEdit::multiline(&mut doc.schema_editor_text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(source_width),
+                );
+                if response.changed() {
+                    doc.schema_editor_dirty = true;
+                }
             });
         protected_rects.push(source_output.inner_rect.expand(4.0));
     } else {
@@ -1628,7 +1701,9 @@ mod tests {
             last_error: None,
             last_error_is_offset: false,
             schema_path: None,
-            schema_source_text: None,
+            schema_editor_text: String::new(),
+            schema_editor_dirty: false,
+            schema_editor_error: None,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
@@ -1665,6 +1740,104 @@ mod tests {
             value: None,
             error: error.map(str::to_string),
         }
+    }
+
+    fn schema_yaml(field_name: &str, value_offset: u64) -> String {
+        format!(
+            r#"
+schema_name: "Test"
+schema_version: 1
+fields:
+  - name: "{field_name}"
+    type: u8
+    offset:
+      kind: Absolute
+      value: {value_offset}
+"#
+        )
+    }
+
+    fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "binocular_gui_{prefix}_{}_{}.{}",
+            std::process::id(),
+            nanos,
+            extension
+        ))
+    }
+
+    fn evaluation_names(doc: &Document) -> Vec<String> {
+        doc.field_evaluations
+            .as_ref()
+            .expect("document should have field evaluations")
+            .iter()
+            .map(|eval| eval.display_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn apply_schema_editor_success_updates_interpretation_and_clears_editor_state() {
+        let mut doc = memory_doc(&[0x12]);
+        doc.schema_path = Some(unique_temp_path("apply_success", "yaml"));
+        doc.schema_editor_text = schema_yaml("renamed", 0);
+        doc.schema_editor_dirty = true;
+        doc.schema_editor_error = Some("old error".to_string());
+        doc.selected_field_range = Some((0, 1));
+        doc.selected_field_name = Some("old".to_string());
+
+        doc.apply_schema_editor();
+
+        assert_eq!(evaluation_names(&doc), vec!["renamed"]);
+        assert!(!doc.schema_editor_dirty);
+        assert!(doc.schema_editor_error.is_none());
+        assert!(doc.selected_field_range.is_none());
+        assert!(doc.selected_field_name.is_none());
+    }
+
+    #[test]
+    fn apply_schema_editor_failure_preserves_previous_good_interpretation() {
+        let mut doc = memory_doc(&[0x12]);
+        doc.schema_path = Some(unique_temp_path("apply_failure", "yaml"));
+        doc.schema_editor_text = schema_yaml("good", 0);
+        doc.apply_schema_editor();
+        doc.selected_field_range = Some((0, 1));
+        doc.selected_field_name = Some("good".to_string());
+
+        doc.schema_editor_text = "schema_name: [".to_string();
+        doc.schema_editor_dirty = true;
+        doc.apply_schema_editor();
+
+        assert_eq!(evaluation_names(&doc), vec!["good"]);
+        assert!(doc.schema_editor_dirty);
+        assert!(doc.schema_editor_error.is_some());
+        assert_eq!(doc.selected_field_range, Some((0, 1)));
+        assert_eq!(doc.selected_field_name.as_deref(), Some("good"));
+    }
+
+    #[test]
+    fn reload_schema_from_disk_replaces_editor_text_and_clears_error_state() {
+        let path = unique_temp_path("reload_success", "yaml");
+        let disk_schema = schema_yaml("from_disk", 0);
+        fs::write(&path, &disk_schema).expect("failed to write schema fixture");
+
+        let mut doc = memory_doc(&[0x12]);
+        doc.schema_path = Some(path.clone());
+        doc.schema_editor_text = "schema_name: [".to_string();
+        doc.schema_editor_dirty = true;
+        doc.schema_editor_error = Some("old error".to_string());
+
+        doc.reload_schema_from_disk();
+
+        assert_eq!(doc.schema_editor_text, disk_schema);
+        assert_eq!(evaluation_names(&doc), vec!["from_disk"]);
+        assert!(!doc.schema_editor_dirty);
+        assert!(doc.schema_editor_error.is_none());
+
+        let _ = fs::remove_file(path);
     }
 
     fn matching_names<'a>(

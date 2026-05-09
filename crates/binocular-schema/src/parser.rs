@@ -402,7 +402,42 @@ pub fn parse_schema_file(path: impl AsRef<Path>) -> Result<Schema, SchemaError> 
     parse_schema_file_inner(&path, &mut stack, None)
 }
 
+pub fn parse_schema_str_with_base_path(
+    yaml: &str,
+    path: impl AsRef<Path>,
+) -> Result<Schema, SchemaError> {
+    let path = absolutize_path(path.as_ref())?;
+    let mut stack = Vec::new();
+    parse_schema_source_inner(yaml, &path, &mut stack, None)
+}
+
 fn parse_schema_file_inner(
+    path: &Path,
+    stack: &mut Vec<PathBuf>,
+    root_endianness: Option<Endianness>,
+) -> Result<Schema, SchemaError> {
+    let normalized = normalize_for_cycle(path)?;
+
+    if let Some(cycle_start) = stack.iter().position(|seen| seen == &normalized) {
+        let cycle = stack[cycle_start..]
+            .iter()
+            .chain(std::iter::once(&normalized))
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        return Err(SchemaError::IncludeCycle { cycle });
+    }
+
+    let yaml = fs::read_to_string(&normalized).map_err(|source| SchemaError::Io {
+        path: normalized.clone(),
+        source,
+    })?;
+
+    parse_schema_source_inner(&yaml, &normalized, stack, root_endianness)
+}
+
+fn parse_schema_source_inner(
+    yaml: &str,
     path: &Path,
     stack: &mut Vec<PathBuf>,
     root_endianness: Option<Endianness>,
@@ -422,11 +457,7 @@ fn parse_schema_file_inner(
     stack.push(normalized.clone());
 
     let result = (|| {
-        let yaml = fs::read_to_string(&normalized).map_err(|source| SchemaError::Io {
-            path: normalized.clone(),
-            source,
-        })?;
-        let raw = parse_raw_schema_str(&yaml)?;
+        let raw = parse_raw_schema_str(yaml)?;
         let root_endianness = if stack.len() == 1 {
             raw.endianness
         } else {
@@ -596,7 +627,17 @@ fn absolutize_path(path: &Path) -> Result<PathBuf, SchemaError> {
 
 fn normalize_for_cycle(path: &Path) -> Result<PathBuf, SchemaError> {
     let absolute = absolutize_path(path)?;
-    Ok(fs::canonicalize(&absolute).unwrap_or(absolute))
+    if let Ok(canonical) = fs::canonicalize(&absolute) {
+        return Ok(canonical);
+    }
+
+    if let (Some(parent), Some(file_name)) = (absolute.parent(), absolute.file_name()) {
+        if let Ok(canonical_parent) = fs::canonicalize(parent) {
+            return Ok(canonical_parent.join(file_name));
+        }
+    }
+
+    Ok(absolute)
 }
 
 #[cfg(test)]
@@ -1647,6 +1688,96 @@ fields:
         let schema = parse_schema_file(dir.join("root.yaml")).expect("include should resolve");
         let names = schema.fields.iter().map(item_name).collect::<Vec<_>>();
         assert_eq!(names, vec!["magic", "version", "flags", "tail"]);
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_str_with_base_path_resolves_relative_includes() {
+        let dir = temp_test_dir("str_base_include");
+        write_file(
+            dir.join("parts").join("common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+fields:
+  - name: "included"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 1
+"#,
+        );
+
+        let root_yaml = r#"
+schema_name: "Root"
+schema_version: 1
+fields:
+  - name: "first"
+    type: u8
+    offset:
+      kind: Absolute
+      value: 0
+  - include: "parts/common.yaml"
+"#;
+
+        let schema = parse_schema_str_with_base_path(root_yaml, dir.join("root.yaml"))
+            .expect("relative include should resolve against base path");
+        let names = schema.fields.iter().map(item_name).collect::<Vec<_>>();
+        assert_eq!(names, vec!["first", "included"]);
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_str_with_base_path_reports_missing_include_file() {
+        let dir = temp_test_dir("str_base_missing_include");
+        let root_yaml = r#"
+schema_name: "Root"
+schema_version: 1
+fields:
+  - include: "missing.yaml"
+"#;
+
+        let err = parse_schema_str_with_base_path(root_yaml, dir.join("root.yaml")).unwrap_err();
+
+        match err {
+            SchemaError::Io { path, .. } => assert!(path.ends_with("missing.yaml")),
+            other => panic!("expected missing include IO error, got {other:?}"),
+        }
+
+        cleanup_test_dir(dir);
+    }
+
+    #[test]
+    fn parse_schema_str_with_base_path_detects_cycle_to_virtual_root() {
+        let dir = temp_test_dir("str_base_include_cycle");
+        write_file(
+            dir.join("common.yaml"),
+            r#"
+schema_name: "Common"
+schema_version: 1
+fields:
+  - include: "root.yaml"
+"#,
+        );
+
+        let root_yaml = r#"
+schema_name: "Root"
+schema_version: 1
+fields:
+  - include: "common.yaml"
+"#;
+
+        let err = parse_schema_str_with_base_path(root_yaml, dir.join("root.yaml")).unwrap_err();
+
+        match err {
+            SchemaError::IncludeCycle { cycle } => {
+                assert!(cycle.contains("root.yaml"));
+                assert!(cycle.contains("common.yaml"));
+            }
+            other => panic!("expected include cycle error, got {other:?}"),
+        }
 
         cleanup_test_dir(dir);
     }
