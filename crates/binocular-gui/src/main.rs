@@ -9,7 +9,8 @@ use eframe::egui;
 const HEX_PAGE_SIZE: usize = 1024;
 const HEX_VIEW_HEIGHT: f32 = 300.0;
 const SIDE_BY_SIDE_MIN_WIDTH: f32 = 760.0;
-const HEX_PANE_WIDTH_FRACTION: f32 = 0.60;
+const HEX_PANE_WIDTH_FRACTION: f32 = 0.50;
+const FIELD_PANE_WIDTH_FRACTION: f32 = 0.25;
 const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DISPLAY_BYTES: usize = 256;
 const SEARCH_CHUNK_SIZE: usize = 64 * 1024;
@@ -24,6 +25,7 @@ struct Document {
     last_error: Option<String>,
     last_error_is_offset: bool,
     schema_path: Option<PathBuf>,
+    schema_source_text: Option<String>,
     hex_start_offset: u64,
     hex_offset_input: String,
     selected_field_range: Option<(u64, usize)>,
@@ -88,10 +90,20 @@ impl BinOcularApp {
             }
         };
 
+        let schema_source_text = match fs::read_to_string(&path) {
+            Ok(source_text) => source_text,
+            Err(err) => {
+                doc.last_error = Some(format!("Failed to read schema source: {err}"));
+                doc.last_error_is_offset = false;
+                return;
+            }
+        };
+
         let evaluations = interpret_schema(doc.buffer.as_ref(), &schema);
         doc.schema = Some(schema);
         doc.field_evaluations = Some(evaluations);
         doc.schema_path = Some(path);
+        doc.schema_source_text = Some(schema_source_text);
         doc.last_error = None;
         doc.last_error_is_offset = false;
         doc.clear_selected_field();
@@ -126,6 +138,7 @@ impl BinOcularApp {
             last_error: None,
             last_error_is_offset: false,
             schema_path: None,
+            schema_source_text: None,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
@@ -163,9 +176,19 @@ impl BinOcularApp {
             }
         };
 
+        let schema_source_text = match fs::read_to_string(&schema_path) {
+            Ok(source_text) => source_text,
+            Err(err) => {
+                doc.last_error = Some(format!("Failed to read schema source: {err}"));
+                doc.last_error_is_offset = false;
+                return;
+            }
+        };
+
         let evaluations = interpret_schema(doc.buffer.as_ref(), &schema);
         doc.schema = Some(schema);
         doc.field_evaluations = Some(evaluations);
+        doc.schema_source_text = Some(schema_source_text);
         doc.last_error = None;
         doc.last_error_is_offset = false;
         doc.clear_selected_field();
@@ -694,28 +717,38 @@ fn draw_side_by_side_document_view(
     let available_width = ui.available_width();
     let pane_gap = ui.spacing().item_spacing.x;
     let pane_height = ui.available_height();
-    let left_width = ((available_width - pane_gap) * HEX_PANE_WIDTH_FRACTION).max(0.0);
-    let right_width = (available_width - pane_gap - left_width).max(0.0);
+    let usable_width = (available_width - (pane_gap * 2.0)).max(0.0);
+    let hex_width = (usable_width * HEX_PANE_WIDTH_FRACTION).max(0.0);
+    let fields_width = (usable_width * FIELD_PANE_WIDTH_FRACTION).max(0.0);
+    let schema_width = (usable_width - hex_width - fields_width).max(0.0);
 
-    // TODO: This is the future insertion point for a schema/YAML investigation pane.
     ui.horizontal(|ui| {
         let mut hex_view_top = None;
 
         ui.allocate_ui_with_layout(
-            egui::vec2(left_width, pane_height),
+            egui::vec2(hex_width, pane_height),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
-                ui.set_width(left_width);
+                ui.set_width(hex_width);
                 hex_view_top = Some(draw_hex_pane(ui, doc, protected_rects, true).top());
             },
         );
 
         ui.allocate_ui_with_layout(
-            egui::vec2(right_width, pane_height),
+            egui::vec2(fields_width, pane_height),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
-                ui.set_width(right_width);
+                ui.set_width(fields_width);
                 draw_fields_pane(ui, doc, protected_rects, hex_view_top);
+            },
+        );
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(schema_width, pane_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(schema_width);
+                draw_schema_pane(ui, doc, protected_rects, true);
             },
         );
     });
@@ -731,6 +764,8 @@ fn draw_stacked_document_view(
     if doc.schema.is_some() {
         ui.separator();
         draw_fields_pane(ui, doc, protected_rects, None);
+        ui.separator();
+        draw_schema_pane(ui, doc, protected_rects, false);
     }
 }
 
@@ -1012,6 +1047,51 @@ fn draw_fields_pane(
     }
 }
 
+fn draw_schema_pane(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    protected_rects: &mut Vec<egui::Rect>,
+    fill_available_height: bool,
+) {
+    if fill_available_height {
+        protected_rects.push(ui.max_rect());
+    }
+
+    protected_rects.push(ui.heading("Schema").rect);
+
+    if let Some(schema_path) = doc.schema_path.as_ref() {
+        let label = if let Some(file_name) = schema_path.file_name() {
+            format!(
+                "{} - {}",
+                file_name.to_string_lossy(),
+                schema_path.display()
+            )
+        } else {
+            schema_path.display().to_string()
+        };
+        protected_rects.push(ui.label(label).rect);
+    }
+
+    if let Some(source_text) = doc.schema_source_text.as_ref() {
+        let max_height = if fill_available_height {
+            ui.available_height().max(120.0)
+        } else {
+            HEX_VIEW_HEIGHT
+        };
+
+        let source_output = egui::ScrollArea::both()
+            .id_source("schema_source_scroll_area")
+            .max_height(max_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.monospace(source_text.as_str());
+            });
+        protected_rects.push(source_output.inner_rect.expand(4.0));
+    } else {
+        protected_rects.push(ui.label("No schema loaded").rect);
+    }
+}
+
 impl eframe::App for BinOcularApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -1111,6 +1191,7 @@ mod tests {
             last_error: None,
             last_error_is_offset: false,
             schema_path: None,
+            schema_source_text: None,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
