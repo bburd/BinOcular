@@ -8,9 +8,14 @@ use eframe::egui;
 
 const HEX_PAGE_SIZE: usize = 1024;
 const HEX_VIEW_HEIGHT: f32 = 300.0;
-const SIDE_BY_SIDE_MIN_WIDTH: f32 = 760.0;
-const HEX_PANE_WIDTH_FRACTION: f32 = 0.50;
-const FIELD_PANE_WIDTH_FRACTION: f32 = 0.25;
+const SPLITTER_WIDTH: f32 = 6.0;
+const HEX_PANE_MIN_WIDTH: f32 = 320.0;
+const FIELD_PANE_MIN_WIDTH: f32 = 220.0;
+const SCHEMA_PANE_MIN_WIDTH: f32 = 220.0;
+const SIDE_BY_SIDE_MIN_WIDTH: f32 =
+    HEX_PANE_MIN_WIDTH + FIELD_PANE_MIN_WIDTH + SCHEMA_PANE_MIN_WIDTH + (SPLITTER_WIDTH * 2.0);
+const DEFAULT_LEFT_SPLIT_FRACTION: f32 = 0.50;
+const DEFAULT_RIGHT_SPLIT_FRACTION: f32 = 0.75;
 const MMAP_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DISPLAY_BYTES: usize = 256;
 const SEARCH_CHUNK_SIZE: usize = 64 * 1024;
@@ -41,6 +46,8 @@ struct Document {
 struct BinOcularApp {
     documents: Vec<Document>,
     current_doc: Option<usize>,
+    left_split_fraction: f32,
+    right_split_fraction: f32,
 }
 
 impl BinOcularApp {
@@ -48,6 +55,8 @@ impl BinOcularApp {
         Self {
             documents: Vec::new(),
             current_doc: None,
+            left_split_fraction: DEFAULT_LEFT_SPLIT_FRACTION,
+            right_split_fraction: DEFAULT_RIGHT_SPLIT_FRACTION,
         }
     }
 
@@ -316,14 +325,17 @@ impl Document {
     }
 }
 
-fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
-    const BYTES_PER_ROW: usize = 16;
+const MIN_HEX_BYTES_PER_ROW: usize = 16;
+const MAX_HEX_BYTES_PER_ROW: usize = 64;
+
+fn draw_hex_view(ui: &mut egui::Ui, doc: &Document, available_width: f32) {
     const SELECTED_BYTE_BG: egui::Color32 = egui::Color32::from_rgb(255, 196, 0);
     const SELECTED_BYTE_FG: egui::Color32 = egui::Color32::from_rgb(24, 24, 24);
     const SEARCH_BYTE_BG: egui::Color32 = egui::Color32::from_rgb(117, 180, 255);
     const SEARCH_BYTE_FG: egui::Color32 = egui::Color32::from_rgb(16, 24, 32);
     const ACTIVE_SEARCH_BYTE_BG: egui::Color32 = egui::Color32::from_rgb(105, 235, 165);
     const ACTIVE_SEARCH_BYTE_FG: egui::Color32 = egui::Color32::from_rgb(8, 28, 18);
+    let bytes_per_row = adaptive_hex_bytes_per_row(ui, available_width);
     let remaining = doc.size.saturating_sub(doc.hex_start_offset);
     let to_show = remaining.min(HEX_PAGE_SIZE as u64) as usize;
 
@@ -356,12 +368,12 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
         visible_end,
     );
 
-    for row_start in (0..bytes.len()).step_by(BYTES_PER_ROW) {
-        let row_end = (row_start + BYTES_PER_ROW).min(bytes.len());
+    for row_start in (0..bytes.len()).step_by(bytes_per_row) {
+        let row_end = (row_start + bytes_per_row).min(bytes.len());
         let row = &bytes[row_start..row_end];
         let mut ascii_column = String::new();
 
-        for i in 0..BYTES_PER_ROW {
+        for i in 0..bytes_per_row {
             if let Some(byte) = row.get(i) {
                 let ch = if (0x20..=0x7E).contains(byte) {
                     *byte as char
@@ -375,7 +387,7 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
         ui.horizontal(|ui| {
             ui.monospace(format!("{:08X}:", doc.hex_start_offset + row_start as u64));
 
-            for i in 0..BYTES_PER_ROW {
+            for i in 0..bytes_per_row {
                 if let Some(byte) = row.get(i) {
                     let absolute_offset = doc.hex_start_offset + row_start as u64 + i as u64;
                     let is_selected = selected_visible_range.is_some_and(|(start, end)| {
@@ -413,6 +425,18 @@ fn draw_hex_view(ui: &mut egui::Ui, doc: &Document) {
             ui.monospace(ascii_column);
         });
     }
+}
+
+fn adaptive_hex_bytes_per_row(ui: &egui::Ui, available_width: f32) -> usize {
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let zero_width = ui.fonts(|fonts| fonts.glyph_width(&font_id, '0'));
+    let spacing = ui.spacing().item_spacing.x;
+    let offset_column_width = zero_width * 9.0 + spacing;
+    let per_byte_width = (zero_width * 3.0) + spacing;
+    let available_for_bytes = (available_width - offset_column_width).max(0.0);
+    let bytes_per_row = (available_for_bytes / per_byte_width).floor() as usize;
+
+    bytes_per_row.clamp(MIN_HEX_BYTES_PER_ROW, MAX_HEX_BYTES_PER_ROW)
 }
 
 fn responsive_text_edit_width(ui: &egui::Ui, preferred: f32, minimum: f32) -> f32 {
@@ -595,18 +619,46 @@ fn draw_field_table(
     selected_range: Option<(u64, usize)>,
     filter_query: &str,
     filter_errors_only: bool,
+    available_width: f32,
 ) -> (Option<(String, u64, usize)>, Vec<egui::Rect>) {
     let mut clicked_field = None;
     let mut row_rects = Vec::new();
+    let spacing_x = ui.spacing().item_spacing.x;
+    let name_column_width = (available_width * 0.22).clamp(120.0, 220.0);
+    let offset_column_width = 104.0;
+    let type_column_width = 76.0;
+    let flexible_width = (available_width
+        - name_column_width
+        - offset_column_width
+        - type_column_width
+        - (spacing_x * 4.0))
+        .max(320.0);
+    let value_column_width = (flexible_width * 0.45).max(160.0);
+    let error_column_width = (flexible_width - value_column_width).max(160.0);
 
     egui::Grid::new("field_evaluations")
         .striped(true)
         .show(ui, |ui| {
-            ui.strong("Name");
-            ui.strong("Offset");
-            ui.strong("Type");
-            ui.strong("Value");
-            ui.strong("Error");
+            ui.add_sized(
+                [name_column_width, ui.spacing().interact_size.y],
+                egui::Label::new(egui::RichText::new("Name").strong()),
+            );
+            ui.add_sized(
+                [offset_column_width, ui.spacing().interact_size.y],
+                egui::Label::new(egui::RichText::new("Offset").strong()),
+            );
+            ui.add_sized(
+                [type_column_width, ui.spacing().interact_size.y],
+                egui::Label::new(egui::RichText::new("Type").strong()),
+            );
+            ui.add_sized(
+                [value_column_width, ui.spacing().interact_size.y],
+                egui::Label::new(egui::RichText::new("Value").strong()),
+            );
+            ui.add_sized(
+                [error_column_width, ui.spacing().interact_size.y],
+                egui::Label::new(egui::RichText::new("Error").strong()),
+            );
             ui.end_row();
 
             for eval in evaluations
@@ -617,45 +669,65 @@ fn draw_field_table(
                     .is_some_and(|selected| selected == (eval.resolved_offset, eval.byte_len));
                 let mut row_clicked = false;
 
-                let response = ui.selectable_label(is_selected, &eval.display_name);
+                let response = ui.add_sized(
+                    [name_column_width, ui.spacing().interact_size.y],
+                    egui::SelectableLabel::new(is_selected, &eval.display_name),
+                );
                 row_clicked |= response.clicked();
                 let mut row_rect = response.rect;
 
-                let response = ui.selectable_label(
-                    is_selected,
-                    egui::RichText::new(format_resolved_offset(
-                        eval.resolved_offset,
-                        eval.offset_valid,
-                    ))
-                    .monospace(),
+                let response = ui.add_sized(
+                    [offset_column_width, ui.spacing().interact_size.y],
+                    egui::SelectableLabel::new(
+                        is_selected,
+                        egui::RichText::new(format_resolved_offset(
+                            eval.resolved_offset,
+                            eval.offset_valid,
+                        ))
+                        .monospace(),
+                    ),
                 );
                 row_clicked |= response.clicked();
                 row_rect = row_rect.union(response.rect);
 
-                let response = ui.selectable_label(is_selected, format!("{:?}", eval.field.ty));
+                let response = ui.add_sized(
+                    [type_column_width, ui.spacing().interact_size.y],
+                    egui::SelectableLabel::new(is_selected, format!("{:?}", eval.field.ty)),
+                );
                 row_clicked |= response.clicked();
                 row_rect = row_rect.union(response.rect);
 
                 if let Some(value) = &eval.value {
-                    let response =
-                        ui.selectable_label(is_selected, format_value(value, eval.byte_len));
+                    let response = ui.add_sized(
+                        [value_column_width, ui.spacing().interact_size.y],
+                        egui::SelectableLabel::new(is_selected, format_value(value, eval.byte_len)),
+                    );
                     row_clicked |= response.clicked();
                     row_rect = row_rect.union(response.rect);
                 } else {
-                    let response = ui.selectable_label(is_selected, "-");
+                    let response = ui.add_sized(
+                        [value_column_width, ui.spacing().interact_size.y],
+                        egui::SelectableLabel::new(is_selected, "-"),
+                    );
                     row_clicked |= response.clicked();
                     row_rect = row_rect.union(response.rect);
                 }
 
                 if let Some(error) = &eval.error {
-                    let response = ui.selectable_label(
-                        is_selected,
-                        egui::RichText::new(error).color(ui.visuals().error_fg_color),
+                    let response = ui.add_sized(
+                        [error_column_width, ui.spacing().interact_size.y],
+                        egui::SelectableLabel::new(
+                            is_selected,
+                            egui::RichText::new(error).color(ui.visuals().error_fg_color),
+                        ),
                     );
                     row_clicked |= response.clicked();
                     row_rect = row_rect.union(response.rect);
                 } else {
-                    let response = ui.selectable_label(is_selected, "-");
+                    let response = ui.add_sized(
+                        [error_column_width, ui.spacing().interact_size.y],
+                        egui::SelectableLabel::new(is_selected, "-"),
+                    );
                     row_clicked |= response.clicked();
                     row_rect = row_rect.union(response.rect);
                 }
@@ -694,12 +766,23 @@ fn draw_field_filter_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Re
     .response
 }
 
-fn draw_document_view(ui: &mut egui::Ui, doc: &mut Document) {
+fn draw_document_view(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    left_split_fraction: &mut f32,
+    right_split_fraction: &mut f32,
+) {
     let panel_rect = ui.max_rect();
     let mut protected_rects = Vec::new();
 
     if ui.available_width() >= SIDE_BY_SIDE_MIN_WIDTH {
-        draw_side_by_side_document_view(ui, doc, &mut protected_rects);
+        draw_side_by_side_document_view(
+            ui,
+            doc,
+            &mut protected_rects,
+            left_split_fraction,
+            right_split_fraction,
+        );
     } else {
         draw_stacked_document_view(ui, doc, &mut protected_rects);
     }
@@ -713,16 +796,17 @@ fn draw_side_by_side_document_view(
     ui: &mut egui::Ui,
     doc: &mut Document,
     protected_rects: &mut Vec<egui::Rect>,
+    left_split_fraction: &mut f32,
+    right_split_fraction: &mut f32,
 ) {
     let available_width = ui.available_width();
-    let pane_gap = ui.spacing().item_spacing.x;
     let pane_height = ui.available_height();
-    let usable_width = (available_width - (pane_gap * 2.0)).max(0.0);
-    let hex_width = (usable_width * HEX_PANE_WIDTH_FRACTION).max(0.0);
-    let fields_width = (usable_width * FIELD_PANE_WIDTH_FRACTION).max(0.0);
-    let schema_width = (usable_width - hex_width - fields_width).max(0.0);
+    let usable_width = (available_width - (SPLITTER_WIDTH * 2.0)).max(0.0);
+    let (hex_width, fields_width, schema_width) =
+        pane_widths(usable_width, left_split_fraction, right_split_fraction);
 
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
         let mut hex_view_top = None;
 
         ui.allocate_ui_with_layout(
@@ -734,6 +818,16 @@ fn draw_side_by_side_document_view(
             },
         );
 
+        draw_splitter(
+            ui,
+            protected_rects,
+            "hex_fields_splitter",
+            usable_width,
+            left_split_fraction,
+            HEX_PANE_MIN_WIDTH,
+            usable_width - FIELD_PANE_MIN_WIDTH - SCHEMA_PANE_MIN_WIDTH,
+        );
+
         ui.allocate_ui_with_layout(
             egui::vec2(fields_width, pane_height),
             egui::Layout::top_down(egui::Align::Min),
@@ -741,6 +835,16 @@ fn draw_side_by_side_document_view(
                 ui.set_width(fields_width);
                 draw_fields_pane(ui, doc, protected_rects, hex_view_top);
             },
+        );
+
+        draw_splitter(
+            ui,
+            protected_rects,
+            "fields_schema_splitter",
+            usable_width,
+            right_split_fraction,
+            HEX_PANE_MIN_WIDTH + FIELD_PANE_MIN_WIDTH,
+            usable_width - SCHEMA_PANE_MIN_WIDTH,
         );
 
         ui.allocate_ui_with_layout(
@@ -752,6 +856,77 @@ fn draw_side_by_side_document_view(
             },
         );
     });
+}
+
+fn pane_widths(
+    usable_width: f32,
+    left_split_fraction: &mut f32,
+    right_split_fraction: &mut f32,
+) -> (f32, f32, f32) {
+    let min_left = HEX_PANE_MIN_WIDTH;
+    let max_left = usable_width - FIELD_PANE_MIN_WIDTH - SCHEMA_PANE_MIN_WIDTH;
+    let min_right = HEX_PANE_MIN_WIDTH + FIELD_PANE_MIN_WIDTH;
+    let max_right = usable_width - SCHEMA_PANE_MIN_WIDTH;
+
+    let left_split = (*left_split_fraction * usable_width).clamp(min_left, max_left);
+    let right_split = (*right_split_fraction * usable_width)
+        .clamp(left_split + FIELD_PANE_MIN_WIDTH, max_right)
+        .clamp(min_right, max_right);
+
+    *left_split_fraction = split_to_fraction(left_split, usable_width);
+    *right_split_fraction = split_to_fraction(right_split, usable_width);
+
+    (
+        left_split,
+        right_split - left_split,
+        usable_width - right_split,
+    )
+}
+
+fn split_to_fraction(split: f32, usable_width: f32) -> f32 {
+    if usable_width > 0.0 {
+        split / usable_width
+    } else {
+        0.0
+    }
+}
+
+fn draw_splitter(
+    ui: &mut egui::Ui,
+    protected_rects: &mut Vec<egui::Rect>,
+    _id_source: &'static str,
+    usable_width: f32,
+    split_fraction_value: &mut f32,
+    min_split: f32,
+    max_split: f32,
+) {
+    let height = ui.available_height();
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(SPLITTER_WIDTH, height),
+        egui::Sense::click_and_drag(),
+    );
+    protected_rects.push(rect.expand(2.0));
+
+    let response = response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+
+    if response.dragged() && usable_width > 0.0 {
+        let pointer_delta_x = ui.ctx().input(|input| input.pointer.delta().x);
+        let split =
+            (*split_fraction_value * usable_width + pointer_delta_x).clamp(min_split, max_split);
+        *split_fraction_value = split_to_fraction(split, usable_width);
+    }
+
+    let visuals = ui.style().interact(&response);
+    let center_x = rect.center().x;
+    let line_top = rect.top() + 4.0;
+    let line_bottom = rect.bottom() - 4.0;
+    ui.painter().line_segment(
+        [
+            egui::pos2(center_x, line_top),
+            egui::pos2(center_x, line_bottom),
+        ],
+        egui::Stroke::new(1.0, visuals.fg_stroke.color),
+    );
 }
 
 fn draw_stacked_document_view(
@@ -813,12 +988,16 @@ fn draw_hex_pane(
         HEX_VIEW_HEIGHT
     };
 
+    let hex_view_width = ui.available_width();
     let hex_output = egui::ScrollArea::both()
         .id_source("hex_view_scroll_area")
+        .max_width(hex_view_width)
         .max_height(max_height)
+        .min_scrolled_width(hex_view_width)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            draw_hex_view(ui, doc);
+            ui.set_width(hex_view_width);
+            draw_hex_view(ui, doc, hex_view_width);
         });
     protected_rects.push(hex_output.inner_rect.expand(4.0));
     hex_output.inner_rect
@@ -1022,19 +1201,25 @@ fn draw_fields_pane(
 
             align_cursor_to(ui, table_top);
             let max_height = ui.available_height().max(120.0);
+            let table_width = ui.available_width();
             let table_output = egui::ScrollArea::both()
                 .id_source("field_table_scroll_area")
+                .max_width(table_width)
                 .max_height(max_height)
+                .min_scrolled_width(table_width)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    ui.set_width(table_width);
                     draw_field_table(
                         ui,
                         evaluations,
                         doc.selected_field_range,
                         &doc.field_filter_query,
                         doc.field_filter_errors_only,
+                        table_width,
                     )
                 });
+            protected_rects.push(table_output.inner_rect.expand(4.0));
             protected_rects.extend(table_output.inner.1);
             table_output.inner.0
         }
@@ -1078,12 +1263,16 @@ fn draw_schema_pane(
         } else {
             HEX_VIEW_HEIGHT
         };
+        let source_width = ui.available_width();
 
         let source_output = egui::ScrollArea::both()
             .id_source("schema_source_scroll_area")
+            .max_width(source_width)
             .max_height(max_height)
+            .min_scrolled_width(source_width)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.set_width(source_width);
                 ui.monospace(source_text.as_str());
             });
         protected_rects.push(source_output.inner_rect.expand(4.0));
@@ -1126,8 +1315,17 @@ impl eframe::App for BinOcularApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(index) = self.current_doc {
+                let mut left_split_fraction = self.left_split_fraction;
+                let mut right_split_fraction = self.right_split_fraction;
                 if let Some(doc) = self.documents.get_mut(index) {
-                    draw_document_view(ui, doc);
+                    draw_document_view(
+                        ui,
+                        doc,
+                        &mut left_split_fraction,
+                        &mut right_split_fraction,
+                    );
+                    self.left_split_fraction = left_split_fraction;
+                    self.right_split_fraction = right_split_fraction;
                     return;
                 }
             }
