@@ -32,6 +32,8 @@ struct Document {
     active_search_query: String,
     search_matches: Vec<u64>,
     current_search_match: Option<usize>,
+    field_filter_query: String,
+    field_filter_errors_only: bool,
 }
 
 struct BinOcularApp {
@@ -132,6 +134,8 @@ impl BinOcularApp {
             active_search_query: String::new(),
             search_matches: Vec::new(),
             current_search_match: None,
+            field_filter_query: String::new(),
+            field_filter_errors_only: false,
         })
     }
 
@@ -547,10 +551,27 @@ fn format_ascii_preview(text: &str, byte_len: usize) -> String {
     format!("{preview}... ({byte_len} bytes)")
 }
 
+fn field_matches_filter(eval: &FieldEval, query: &str, errors_only: bool) -> bool {
+    if errors_only && eval.error.is_none() {
+        return false;
+    }
+
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+
+    eval.display_name
+        .to_lowercase()
+        .contains(&query.to_lowercase())
+}
+
 fn draw_field_table(
     ui: &mut egui::Ui,
     evaluations: &[FieldEval],
     selected_range: Option<(u64, usize)>,
+    filter_query: &str,
+    filter_errors_only: bool,
 ) -> (Option<(String, u64, usize)>, Vec<egui::Rect>) {
     let mut clicked_field = None;
     let mut row_rects = Vec::new();
@@ -565,7 +586,10 @@ fn draw_field_table(
             ui.strong("Error");
             ui.end_row();
 
-            for eval in evaluations {
+            for eval in evaluations
+                .iter()
+                .filter(|eval| field_matches_filter(eval, filter_query, filter_errors_only))
+            {
                 let is_selected = selected_range
                     .is_some_and(|selected| selected == (eval.resolved_offset, eval.byte_len));
                 let mut row_clicked = false;
@@ -634,6 +658,19 @@ fn draw_field_table(
     (clicked_field, row_rects)
 }
 
+fn draw_field_filter_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Response {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Filter:");
+        let width = responsive_text_edit_width(ui, 180.0, 80.0);
+        let _ = ui.add_sized(
+            [width, ui.spacing().interact_size.y],
+            egui::TextEdit::singleline(&mut doc.field_filter_query),
+        );
+        ui.checkbox(&mut doc.field_filter_errors_only, "Errors Only");
+    })
+    .response
+}
+
 fn draw_document_view(ui: &mut egui::Ui, doc: &mut Document) {
     let panel_rect = ui.max_rect();
     let mut protected_rects = Vec::new();
@@ -678,13 +715,7 @@ fn draw_side_by_side_document_view(
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.set_width(right_width);
-                if let Some(hex_view_top) = hex_view_top {
-                    let spacer_height = hex_view_top - ui.cursor().top();
-                    if spacer_height > 0.0 {
-                        ui.add_space(spacer_height);
-                    }
-                }
-                draw_fields_pane(ui, doc, protected_rects);
+                draw_fields_pane(ui, doc, protected_rects, hex_view_top);
             },
         );
     });
@@ -699,7 +730,7 @@ fn draw_stacked_document_view(
 
     if doc.schema.is_some() {
         ui.separator();
-        draw_fields_pane(ui, doc, protected_rects);
+        draw_fields_pane(ui, doc, protected_rects, None);
     }
 }
 
@@ -888,7 +919,21 @@ fn draw_search_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Response
     .response
 }
 
-fn draw_fields_pane(ui: &mut egui::Ui, doc: &mut Document, protected_rects: &mut Vec<egui::Rect>) {
+fn align_cursor_to(ui: &mut egui::Ui, top: Option<f32>) {
+    if let Some(top) = top {
+        let spacer_height = top - ui.cursor().top();
+        if spacer_height > 0.0 {
+            ui.add_space(spacer_height);
+        }
+    }
+}
+
+fn draw_fields_pane(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    protected_rects: &mut Vec<egui::Rect>,
+    table_top: Option<f32>,
+) {
     if doc.schema.is_none() {
         return;
     }
@@ -910,17 +955,50 @@ fn draw_fields_pane(ui: &mut egui::Ui, doc: &mut Document, protected_rects: &mut
         protected_rects.push(ui.label(schema_label).rect);
     }
 
+    protected_rects.push(draw_field_filter_controls(ui, doc).rect);
+
     let clicked_field = if let Some(evaluations) = doc.field_evaluations.as_ref() {
         if evaluations.is_empty() {
             None
         } else {
+            let visible_count = evaluations
+                .iter()
+                .filter(|eval| {
+                    field_matches_filter(
+                        eval,
+                        &doc.field_filter_query,
+                        doc.field_filter_errors_only,
+                    )
+                })
+                .count();
+            protected_rects.push(
+                ui.label(format!(
+                    "Showing {visible_count} / {} fields",
+                    evaluations.len()
+                ))
+                .rect,
+            );
+
+            if visible_count == 0 {
+                align_cursor_to(ui, table_top);
+                protected_rects.push(ui.label("No matching fields").rect);
+                return;
+            }
+
+            align_cursor_to(ui, table_top);
             let max_height = ui.available_height().max(120.0);
             let table_output = egui::ScrollArea::both()
                 .id_source("field_table_scroll_area")
                 .max_height(max_height)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    draw_field_table(ui, evaluations, doc.selected_field_range)
+                    draw_field_table(
+                        ui,
+                        evaluations,
+                        doc.selected_field_range,
+                        &doc.field_filter_query,
+                        doc.field_filter_errors_only,
+                    )
                 });
             protected_rects.extend(table_output.inner.1);
             table_output.inner.0
@@ -1041,7 +1119,112 @@ mod tests {
             active_search_query: String::new(),
             search_matches: Vec::new(),
             current_search_match: None,
+            field_filter_query: String::new(),
+            field_filter_errors_only: false,
         }
+    }
+
+    fn field_eval(display_name: &str, error: Option<&str>) -> FieldEval {
+        FieldEval {
+            field: binocular_schema::ast::FieldDef {
+                name: display_name.to_string(),
+                ty: binocular_schema::ast::FieldType::U8,
+                offset: binocular_schema::ast::OffsetKind::Absolute(0),
+                length: None,
+                endianness: None,
+                description: None,
+                repeat: None,
+                when: None,
+            },
+            display_name: display_name.to_string(),
+            resolved_offset: 0,
+            offset_valid: true,
+            byte_len: 1,
+            value: None,
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn matching_names<'a>(
+        evaluations: &'a [FieldEval],
+        query: &str,
+        errors_only: bool,
+    ) -> Vec<&'a str> {
+        evaluations
+            .iter()
+            .filter(|eval| field_matches_filter(eval, query, errors_only))
+            .map(|eval| eval.display_name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn field_filter_empty_query_shows_all_rows() {
+        let evaluations = vec![
+            field_eval("header.magic", None),
+            field_eval("packet.header.length", Some("short read")),
+            field_eval("payload", None),
+        ];
+
+        assert_eq!(
+            matching_names(&evaluations, "", false),
+            vec!["header.magic", "packet.header.length", "payload"]
+        );
+    }
+
+    #[test]
+    fn field_filter_matches_name_substrings() {
+        let evaluations = vec![
+            field_eval("header.magic", None),
+            field_eval("packet.header.length", None),
+            field_eval("payload", None),
+        ];
+
+        assert_eq!(
+            matching_names(&evaluations, "header", false),
+            vec!["header.magic", "packet.header.length"]
+        );
+    }
+
+    #[test]
+    fn field_filter_is_case_insensitive() {
+        let evaluations = vec![
+            field_eval("Header.Magic", None),
+            field_eval("packet.HEADER.length", None),
+            field_eval("payload", None),
+        ];
+
+        assert_eq!(
+            matching_names(&evaluations, "header", false),
+            vec!["Header.Magic", "packet.HEADER.length"]
+        );
+    }
+
+    #[test]
+    fn field_filter_errors_only_shows_error_rows() {
+        let evaluations = vec![
+            field_eval("header.magic", None),
+            field_eval("packet.header.length", Some("short read")),
+            field_eval("payload", Some("invalid offset")),
+        ];
+
+        assert_eq!(
+            matching_names(&evaluations, "", true),
+            vec!["packet.header.length", "payload"]
+        );
+    }
+
+    #[test]
+    fn field_filter_query_and_errors_only_both_apply() {
+        let evaluations = vec![
+            field_eval("header.magic", None),
+            field_eval("packet.header.length", Some("short read")),
+            field_eval("payload", Some("invalid offset")),
+        ];
+
+        assert_eq!(
+            matching_names(&evaluations, "header", true),
+            vec!["packet.header.length"]
+        );
     }
 
     #[test]
