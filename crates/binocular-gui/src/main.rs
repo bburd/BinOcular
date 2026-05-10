@@ -77,6 +77,22 @@ struct GuiDiagnostic {
     snippet: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SchemaMatch {
+    line: usize,
+    line_start_byte: usize,
+    line_end_byte: usize,
+    snippet: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClickedField {
+    display_name: String,
+    schema_field_name: String,
+    offset: u64,
+    byte_len: usize,
+}
+
 struct Document {
     _path: PathBuf,
     name: String,
@@ -92,6 +108,8 @@ struct Document {
     schema_editor_error: Option<String>,
     schema_diagnostics: Vec<GuiDiagnostic>,
     active_schema_diagnostic: Option<usize>,
+    schema_match: Option<SchemaMatch>,
+    schema_match_scroll_pending: bool,
     hex_start_offset: u64,
     hex_offset_input: String,
     selected_field_range: Option<(u64, usize)>,
@@ -229,6 +247,8 @@ impl BinOcularApp {
             schema_editor_error: None,
             schema_diagnostics: Vec::new(),
             active_schema_diagnostic: None,
+            schema_match: None,
+            schema_match_scroll_pending: false,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
@@ -272,6 +292,11 @@ impl Document {
         self.clear_selected_field();
     }
 
+    fn clear_schema_match(&mut self) {
+        self.schema_match = None;
+        self.schema_match_scroll_pending = false;
+    }
+
     fn clear_schema_diagnostics(&mut self) {
         self.schema_diagnostics.clear();
         self.active_schema_diagnostic = None;
@@ -280,6 +305,7 @@ impl Document {
     fn set_schema_diagnostic(&mut self, diagnostic: GuiDiagnostic) {
         self.schema_diagnostics = vec![diagnostic];
         self.active_schema_diagnostic = Some(0);
+        self.clear_schema_match();
     }
 
     fn apply_schema_editor(&mut self) {
@@ -427,6 +453,7 @@ impl Document {
         } else {
             self.selected_field_name = Some(name.to_string());
             self.selected_field_range = None;
+            self.clear_schema_match();
         }
     }
 
@@ -444,15 +471,27 @@ impl Document {
     fn clear_selected_field(&mut self) {
         self.selected_field_range = None;
         self.selected_field_name = None;
+        self.clear_schema_match();
     }
 
     fn select_field(&mut self, name: String, offset: u64, byte_len: usize) {
+        self.select_field_with_schema_name(name.clone(), name, offset, byte_len);
+    }
+
+    fn select_field_with_schema_name(
+        &mut self,
+        display_name: String,
+        schema_field_name: String,
+        offset: u64,
+        byte_len: usize,
+    ) {
         eprintln!(
             "select_field: doc={:p} name={} offset=0x{:X} len={}",
-            self, name, offset, byte_len
+            self, display_name, offset, byte_len
         );
-        self.selected_field_name = Some(name);
+        self.selected_field_name = Some(display_name.clone());
         self.selected_field_range = Some((offset, byte_len));
+        self.update_schema_match_for_field(&display_name, &schema_field_name);
 
         if byte_len == 0 {
             return;
@@ -464,6 +503,17 @@ impl Document {
             let new_offset = offset.min(max_start);
             self.hex_start_offset = new_offset;
             self.hex_offset_input = format!("0x{:X}", new_offset);
+        }
+    }
+
+    fn update_schema_match_for_field(&mut self, display_name: &str, schema_field_name: &str) {
+        if let Some(schema_match) =
+            find_best_schema_name_match(&self.schema_editor_text, display_name, schema_field_name)
+        {
+            self.schema_match = Some(schema_match);
+            self.schema_match_scroll_pending = true;
+        } else {
+            self.clear_schema_match();
         }
     }
 
@@ -990,6 +1040,152 @@ fn source_snippet(source: &str, line: usize) -> Option<String> {
     Some(snippet.join("\n"))
 }
 
+fn find_best_schema_name_match(
+    source: &str,
+    display_name: &str,
+    schema_field_name: &str,
+) -> Option<SchemaMatch> {
+    let candidates = schema_match_candidates(display_name, schema_field_name);
+
+    for candidate in candidates {
+        if let Some(schema_match) = find_schema_name_entry(source, &candidate) {
+            return Some(schema_match);
+        }
+    }
+
+    None
+}
+
+fn schema_match_candidates(display_name: &str, schema_field_name: &str) -> Vec<String> {
+    let normalized_display_name = strip_repeat_indexes(display_name);
+    let normalized_schema_field_name = strip_repeat_indexes(schema_field_name);
+    let leaf_name = normalized_display_name
+        .rsplit_once('.')
+        .map_or(normalized_display_name.as_str(), |(_, leaf)| leaf)
+        .to_string();
+
+    let mut candidates = Vec::new();
+    for candidate in [
+        normalized_display_name,
+        normalized_schema_field_name,
+        leaf_name,
+    ] {
+        if !candidate.is_empty() && !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates
+}
+
+fn strip_repeat_indexes(name: &str) -> String {
+    let chars = name.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] == '[' {
+            let index_start = index;
+            index += 1;
+            let digit_start = index;
+            while index < chars.len() && chars[index].is_ascii_digit() {
+                index += 1;
+            }
+
+            if index < chars.len() && chars[index] == ']' && index > digit_start {
+                index += 1;
+                continue;
+            }
+
+            output.extend(chars[index_start..index].iter());
+        } else {
+            output.push(chars[index]);
+            index += 1;
+        }
+    }
+
+    output
+}
+
+fn find_schema_name_entry(source: &str, target_name: &str) -> Option<SchemaMatch> {
+    let mut line_start_byte = 0;
+
+    for (line_index, segment) in source.split_inclusive('\n').enumerate() {
+        let line_without_lf = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line_without_lf
+            .strip_suffix('\r')
+            .unwrap_or(line_without_lf);
+
+        if let Some(value) = parse_schema_name_entry(line) {
+            if value.name == target_name {
+                return Some(SchemaMatch {
+                    line: line_index + 1,
+                    line_start_byte,
+                    line_end_byte: line_start_byte + line.len(),
+                    snippet: line.trim().to_string(),
+                });
+            }
+        }
+
+        line_start_byte += segment.len();
+    }
+
+    None
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SchemaNameEntry {
+    name: String,
+}
+
+fn parse_schema_name_entry(line: &str) -> Option<SchemaNameEntry> {
+    let mut rest = line.trim_start();
+
+    if let Some(after_dash) = rest.strip_prefix('-') {
+        if !after_dash.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        rest = after_dash.trim_start();
+    }
+
+    let value = rest.strip_prefix("name:")?.trim_start();
+    let name = parse_schema_name_value(value);
+    Some(SchemaNameEntry { name })
+}
+
+fn parse_schema_name_value(value: &str) -> String {
+    let Some(first_char) = value.chars().next() else {
+        return String::new();
+    };
+
+    if first_char == '"' || first_char == '\'' {
+        let quote = first_char;
+        let mut escaped = false;
+        let mut name = String::new();
+
+        for ch in value[first_char.len_utf8()..].chars() {
+            if escaped {
+                name.push(ch);
+                escaped = false;
+            } else if quote == '"' && ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                break;
+            } else {
+                name.push(ch);
+            }
+        }
+
+        name
+    } else {
+        value
+            .split_once('#')
+            .map_or(value, |(before_comment, _)| before_comment)
+            .trim_end()
+            .to_string()
+    }
+}
+
 fn runtime_diagnostic_from_field_eval(eval: &FieldEval) -> Option<GuiDiagnostic> {
     let error = eval.error.as_ref()?;
     Some(GuiDiagnostic {
@@ -1102,7 +1298,7 @@ fn draw_field_table(
     collapsed_groups: &mut HashSet<String>,
     selected_range: Option<(u64, usize)>,
     available_width: f32,
-) -> (Option<(String, u64, usize)>, Vec<egui::Rect>) {
+) -> (Option<ClickedField>, Vec<egui::Rect>) {
     let mut clicked_field = None;
     let mut row_rects = Vec::new();
     let spacing_x = ui.spacing().item_spacing.x;
@@ -1244,7 +1440,7 @@ fn draw_field_eval_row(
     display_name: &str,
     selected_range: Option<(u64, usize)>,
     widths: &FieldTableWidths,
-) -> (Option<(String, u64, usize)>, egui::Rect) {
+) -> (Option<ClickedField>, egui::Rect) {
     let is_selected =
         selected_range.is_some_and(|selected| selected == (eval.resolved_offset, eval.byte_len));
     let mut row_clicked = false;
@@ -1321,11 +1517,12 @@ fn draw_field_eval_row(
             eval.display_name, eval.resolved_offset, eval.byte_len
         );
         (
-            Some((
-                eval.display_name.clone(),
-                eval.resolved_offset,
-                eval.byte_len,
-            )),
+            Some(ClickedField {
+                display_name: eval.display_name.clone(),
+                schema_field_name: eval.field.name.clone(),
+                offset: eval.resolved_offset,
+                byte_len: eval.byte_len,
+            }),
             row_rect,
         )
     } else {
@@ -1811,8 +2008,13 @@ fn draw_fields_pane(
         None
     };
 
-    if let Some((name, offset, byte_len)) = clicked_field {
-        doc.select_field(name, offset, byte_len);
+    if let Some(field) = clicked_field {
+        doc.select_field_with_schema_name(
+            field.display_name,
+            field.schema_field_name,
+            field.offset,
+            field.byte_len,
+        );
     }
 }
 
@@ -1934,6 +2136,44 @@ fn diagnostic_target_suffix(diagnostic: &GuiDiagnostic) -> String {
     }
 }
 
+fn schema_editor_layout_job(
+    ui: &egui::Ui,
+    text: &str,
+    wrap_width: f32,
+    highlighted_line: Option<(usize, usize, usize)>,
+) -> Arc<egui::Galley> {
+    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+    let text_color = ui.visuals().text_color();
+    let base_format = egui::TextFormat {
+        font_id,
+        color: text_color,
+        ..Default::default()
+    };
+    let mut highlight_format = base_format.clone();
+    highlight_format.background = egui::Color32::from_rgba_unmultiplied(255, 216, 77, 60);
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+
+    if let Some((_, line_start, line_end)) = highlighted_line {
+        if line_start <= line_end
+            && line_end <= text.len()
+            && text.is_char_boundary(line_start)
+            && text.is_char_boundary(line_end)
+        {
+            job.append(&text[..line_start], 0.0, base_format.clone());
+            job.append(&text[line_start..line_end], 0.0, highlight_format);
+            job.append(&text[line_end..], 0.0, base_format);
+        } else {
+            job.append(text, 0.0, base_format);
+        }
+    } else {
+        job.append(text, 0.0, base_format);
+    }
+
+    ui.fonts(|fonts| fonts.layout_job(job))
+}
+
 fn draw_schema_pane(
     ui: &mut egui::Ui,
     doc: &mut Document,
@@ -1995,6 +2235,17 @@ fn draw_schema_pane(
     }
 
     if !doc.schema_editor_text.is_empty() || doc.schema_path.is_some() {
+        if let Some(schema_match) = doc.schema_match.as_ref() {
+            let status = ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Best schema match: line {}", schema_match.line))
+                        .strong(),
+                );
+                ui.monospace(&schema_match.snippet);
+            });
+            protected_rects.push(status.response.rect);
+        }
+
         let diagnostics_reserved_height = if doc.diagnostic_count() > 0 {
             190.0
         } else {
@@ -2006,6 +2257,15 @@ fn draw_schema_pane(
             HEX_VIEW_HEIGHT
         };
         let source_width = ui.available_width();
+        let highlighted_line = doc.schema_match.as_ref().map(|schema_match| {
+            (
+                schema_match.line,
+                schema_match.line_start_byte,
+                schema_match.line_end_byte,
+            )
+        });
+        let mut did_scroll_to_schema_match = false;
+        let scroll_to_schema_match = doc.schema_match_scroll_pending;
 
         let source_output = egui::ScrollArea::both()
             .id_source("schema_source_scroll_area")
@@ -2015,17 +2275,37 @@ fn draw_schema_pane(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_width(source_width);
+                if let (true, Some((line, _, _))) = (scroll_to_schema_match, highlighted_line) {
+                    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+                    let content_origin = ui.cursor().min;
+                    let line_top = content_origin.y + row_height * line.saturating_sub(1) as f32;
+                    let target_rect = egui::Rect::from_min_size(
+                        egui::pos2(content_origin.x, line_top),
+                        egui::vec2(source_width, row_height),
+                    );
+                    ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
+                    did_scroll_to_schema_match = true;
+                }
+
+                let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                    schema_editor_layout_job(ui, text, wrap_width, highlighted_line)
+                };
                 let response = ui.add_sized(
                     [source_width, max_height],
                     egui::TextEdit::multiline(&mut doc.schema_editor_text)
                         .font(egui::TextStyle::Monospace)
-                        .desired_width(source_width),
+                        .desired_width(source_width)
+                        .layouter(&mut layouter),
                 );
                 if response.changed() {
                     doc.schema_editor_dirty = true;
+                    doc.clear_schema_match();
                 }
             });
         protected_rects.push(source_output.inner_rect.expand(4.0));
+        if did_scroll_to_schema_match {
+            doc.schema_match_scroll_pending = false;
+        }
     } else {
         protected_rects.push(ui.label("No schema loaded").rect);
     }
@@ -2155,6 +2435,8 @@ mod tests {
             schema_editor_error: None,
             schema_diagnostics: Vec::new(),
             active_schema_diagnostic: None,
+            schema_match: None,
+            schema_match_scroll_pending: false,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
@@ -2228,6 +2510,123 @@ fields:
             .iter()
             .map(|eval| eval.display_name.clone())
             .collect()
+    }
+
+    #[test]
+    fn schema_name_matching_handles_quoted_and_unquoted_values() {
+        let source = r#"
+fields:
+  - name: "magic"
+  - name: 'length'
+  - name: payload # inline comment
+"#;
+
+        assert_eq!(
+            find_best_schema_name_match(source, "magic", "magic")
+                .map(|schema_match| schema_match.line),
+            Some(3)
+        );
+        assert_eq!(
+            find_best_schema_name_match(source, "length", "length")
+                .map(|schema_match| schema_match.line),
+            Some(4)
+        );
+        assert_eq!(
+            find_best_schema_name_match(source, "payload", "payload")
+                .map(|schema_match| schema_match.line),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn schema_name_matching_strips_repeat_indexes() {
+        let source = r#"
+fields:
+  - name: field
+"#;
+
+        assert_eq!(
+            find_best_schema_name_match(source, "field[0]", "field")
+                .map(|schema_match| schema_match.line),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn schema_name_matching_uses_nested_leaf_name() {
+        let source = r#"
+structures:
+  - name: Header
+    fields:
+      - name: magic
+"#;
+
+        assert_eq!(
+            find_best_schema_name_match(source, "header.magic", "magic")
+                .map(|schema_match| schema_match.line),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn schema_name_matching_ignores_schema_name() {
+        let source = r#"
+schema_name: magic
+fields:
+  - name: payload
+"#;
+
+        assert_eq!(
+            find_best_schema_name_match(source, "magic", "magic")
+                .map(|schema_match| schema_match.line),
+            None
+        );
+    }
+
+    #[test]
+    fn schema_name_matching_chooses_first_equal_match() {
+        let source = r#"
+fields:
+  - name: id
+  - name: id
+"#;
+
+        assert_eq!(
+            find_best_schema_name_match(source, "records.id", "id")
+                .map(|schema_match| schema_match.line),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn selecting_field_updates_or_clears_schema_match() {
+        let mut doc = memory_doc(&[0x12]);
+        doc.schema_editor_text = r#"
+schema_name: "Test"
+fields:
+  - name: magic
+    type: u8
+"#
+        .to_string();
+
+        doc.select_field_with_schema_name("header.magic".to_string(), "magic".to_string(), 0, 1);
+
+        assert_eq!(doc.selected_field_name.as_deref(), Some("header.magic"));
+        assert_eq!(doc.selected_field_range, Some((0, 1)));
+        assert_eq!(
+            doc.schema_match
+                .as_ref()
+                .map(|schema_match| schema_match.line),
+            Some(4)
+        );
+        assert!(doc.schema_match_scroll_pending);
+
+        doc.select_field_with_schema_name("missing".to_string(), "missing".to_string(), 0, 1);
+
+        assert_eq!(doc.selected_field_name.as_deref(), Some("missing"));
+        assert_eq!(doc.selected_field_range, Some((0, 1)));
+        assert!(doc.schema_match.is_none());
+        assert!(!doc.schema_match_scroll_pending);
     }
 
     #[test]
