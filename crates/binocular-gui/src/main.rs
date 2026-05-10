@@ -86,11 +86,19 @@ struct SchemaMatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct SchemaHighlight {
+    line: usize,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ClickedField {
     display_name: String,
     schema_field_name: String,
     offset: u64,
     byte_len: usize,
+    offset_valid: bool,
 }
 
 struct Document {
@@ -110,10 +118,13 @@ struct Document {
     active_schema_diagnostic: Option<usize>,
     schema_match: Option<SchemaMatch>,
     schema_match_scroll_pending: bool,
+    schema_cursor_name_highlight: Option<SchemaHighlight>,
+    schema_editor_cursor_char_index: Option<usize>,
     hex_start_offset: u64,
     hex_offset_input: String,
     selected_field_range: Option<(u64, usize)>,
     selected_field_name: Option<String>,
+    selected_field_scroll_pending: bool,
     search_query: String,
     search_mode: SearchMode,
     active_search_query: String,
@@ -249,10 +260,13 @@ impl BinOcularApp {
             active_schema_diagnostic: None,
             schema_match: None,
             schema_match_scroll_pending: false,
+            schema_cursor_name_highlight: None,
+            schema_editor_cursor_char_index: None,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
             selected_field_name: None,
+            selected_field_scroll_pending: false,
             search_query: String::new(),
             search_mode: SearchMode::Ascii,
             active_search_query: String::new(),
@@ -286,6 +300,8 @@ impl Document {
         self.field_evaluations = Some(evaluations);
         self.schema_editor_dirty = false;
         self.schema_editor_error = None;
+        self.clear_schema_cursor_name_highlight();
+        self.schema_editor_cursor_char_index = None;
         self.clear_schema_diagnostics();
         self.last_error = None;
         self.last_error_is_offset = false;
@@ -297,6 +313,10 @@ impl Document {
         self.schema_match_scroll_pending = false;
     }
 
+    fn clear_schema_cursor_name_highlight(&mut self) {
+        self.schema_cursor_name_highlight = None;
+    }
+
     fn clear_schema_diagnostics(&mut self) {
         self.schema_diagnostics.clear();
         self.active_schema_diagnostic = None;
@@ -306,6 +326,7 @@ impl Document {
         self.schema_diagnostics = vec![diagnostic];
         self.active_schema_diagnostic = Some(0);
         self.clear_schema_match();
+        self.clear_schema_cursor_name_highlight();
     }
 
     fn apply_schema_editor(&mut self) {
@@ -383,6 +404,8 @@ impl Document {
                 self.schema_editor_text = schema_source_text;
                 self.schema_editor_dirty = false;
                 self.schema_editor_error = Some(error.clone());
+                self.clear_schema_cursor_name_highlight();
+                self.schema_editor_cursor_char_index = None;
                 let diagnostic = schema_error_diagnostic(
                     &err,
                     Some(&schema_path),
@@ -450,10 +473,13 @@ impl Document {
         self.field_filter_errors_only = false;
         if offset_valid {
             self.select_field(name.to_string(), offset, byte_len);
+            self.selected_field_scroll_pending = true;
         } else {
             self.selected_field_name = Some(name.to_string());
             self.selected_field_range = None;
+            self.selected_field_scroll_pending = true;
             self.clear_schema_match();
+            self.clear_schema_cursor_name_highlight();
         }
     }
 
@@ -471,7 +497,9 @@ impl Document {
     fn clear_selected_field(&mut self) {
         self.selected_field_range = None;
         self.selected_field_name = None;
+        self.selected_field_scroll_pending = false;
         self.clear_schema_match();
+        self.clear_schema_cursor_name_highlight();
     }
 
     fn select_field(&mut self, name: String, offset: u64, byte_len: usize) {
@@ -491,6 +519,7 @@ impl Document {
         );
         self.selected_field_name = Some(display_name.clone());
         self.selected_field_range = Some((offset, byte_len));
+        self.clear_schema_cursor_name_highlight();
         self.update_schema_match_for_field(&display_name, &schema_field_name);
 
         if byte_len == 0 {
@@ -514,6 +543,59 @@ impl Document {
             self.schema_match_scroll_pending = true;
         } else {
             self.clear_schema_match();
+        }
+    }
+
+    fn select_field_from_schema(&mut self, field: ClickedField) {
+        self.clear_schema_match();
+
+        if let Some((group, _)) = split_field_group(&field.display_name) {
+            self.collapsed_field_groups.remove(group);
+        }
+
+        if !field_name_matches_filter(&field.display_name, &self.field_filter_query) {
+            self.field_filter_query.clear();
+        }
+        self.field_filter_errors_only = false;
+
+        self.selected_field_name = Some(field.display_name);
+        self.selected_field_range = field.offset_valid.then_some((field.offset, field.byte_len));
+        self.selected_field_scroll_pending = true;
+
+        if !field.offset_valid || field.byte_len == 0 {
+            return;
+        }
+
+        let page_end = self.hex_start_offset.saturating_add(HEX_PAGE_SIZE as u64);
+        if field.offset < self.hex_start_offset || field.offset >= page_end {
+            let max_start = self.size.saturating_sub(HEX_PAGE_SIZE as u64);
+            let new_offset = field.offset.min(max_start);
+            self.hex_start_offset = new_offset;
+            self.hex_offset_input = format!("0x{:X}", new_offset);
+        }
+    }
+
+    fn activate_schema_editor_cursor_line(&mut self, line_index: usize) {
+        let Some(name_entry) =
+            schema_field_name_match_at_line(&self.schema_editor_text, line_index)
+        else {
+            self.clear_schema_cursor_name_highlight();
+            self.selected_field_scroll_pending = false;
+            return;
+        };
+
+        let Some(evaluations) = self.field_evaluations.as_ref() else {
+            self.clear_schema_cursor_name_highlight();
+            self.selected_field_scroll_pending = false;
+            return;
+        };
+
+        if let Some(field) = find_best_field_for_schema_name(evaluations, &name_entry.name) {
+            self.schema_cursor_name_highlight = Some(name_entry.highlight);
+            self.select_field_from_schema(field);
+        } else {
+            self.clear_schema_cursor_name_highlight();
+            self.selected_field_scroll_pending = false;
         }
     }
 
@@ -1136,54 +1218,162 @@ fn find_schema_name_entry(source: &str, target_name: &str) -> Option<SchemaMatch
 #[derive(Debug, PartialEq, Eq)]
 struct SchemaNameEntry {
     name: String,
+    name_start_byte: usize,
+    name_end_byte: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SchemaNameLineMatch {
+    name: String,
+    highlight: SchemaHighlight,
+}
+
+fn schema_field_name_match_at_line(source: &str, line_index: usize) -> Option<SchemaNameLineMatch> {
+    let mut line_start_byte = 0;
+
+    for (current_line_index, segment) in source.split_inclusive('\n').enumerate() {
+        let line_without_lf = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line_without_lf
+            .strip_suffix('\r')
+            .unwrap_or(line_without_lf);
+
+        if current_line_index == line_index {
+            let entry = parse_schema_name_entry(line)?;
+            return Some(SchemaNameLineMatch {
+                name: entry.name,
+                highlight: SchemaHighlight {
+                    line: line_index + 1,
+                    start_byte: line_start_byte + entry.name_start_byte,
+                    end_byte: line_start_byte + entry.name_end_byte,
+                },
+            });
+        }
+
+        line_start_byte += segment.len();
+    }
+
+    None
+}
+
+fn line_index_for_char_index(source: &str, char_index: usize) -> usize {
+    let mut line_index = 0;
+
+    for (index, ch) in source.chars().enumerate() {
+        if index >= char_index {
+            break;
+        }
+
+        if ch == '\n' {
+            line_index += 1;
+        }
+    }
+
+    line_index
 }
 
 fn parse_schema_name_entry(line: &str) -> Option<SchemaNameEntry> {
     let mut rest = line.trim_start();
+    let mut rest_start_byte = line.len() - rest.len();
 
     if let Some(after_dash) = rest.strip_prefix('-') {
         if !after_dash.chars().next().is_some_and(char::is_whitespace) {
             return None;
         }
-        rest = after_dash.trim_start();
+        let trimmed_after_dash = after_dash.trim_start();
+        rest_start_byte += 1 + after_dash.len() - trimmed_after_dash.len();
+        rest = trimmed_after_dash;
     }
 
-    let value = rest.strip_prefix("name:")?.trim_start();
-    let name = parse_schema_name_value(value);
-    Some(SchemaNameEntry { name })
+    let after_key = rest.strip_prefix("name:")?;
+    let value = after_key.trim_start();
+    let value_start_byte = rest_start_byte + "name:".len() + after_key.len() - value.len();
+    let (name, value_name_start, value_name_end) = parse_schema_name_value_span(value)?;
+    let name = strip_repeat_indexes(&name);
+    (!name.is_empty()).then_some(SchemaNameEntry {
+        name,
+        name_start_byte: value_start_byte + value_name_start,
+        name_end_byte: value_start_byte + value_name_end,
+    })
 }
 
-fn parse_schema_name_value(value: &str) -> String {
-    let Some(first_char) = value.chars().next() else {
-        return String::new();
-    };
+fn parse_schema_name_value_span(value: &str) -> Option<(String, usize, usize)> {
+    let first_char = value.chars().next()?;
 
     if first_char == '"' || first_char == '\'' {
         let quote = first_char;
         let mut escaped = false;
         let mut name = String::new();
+        let name_start = first_char.len_utf8();
+        let mut name_end = value.len();
 
-        for ch in value[first_char.len_utf8()..].chars() {
+        for (offset, ch) in value[name_start..].char_indices() {
+            let absolute_offset = name_start + offset;
             if escaped {
                 name.push(ch);
                 escaped = false;
             } else if quote == '"' && ch == '\\' {
                 escaped = true;
             } else if ch == quote {
+                name_end = absolute_offset;
                 break;
             } else {
                 name.push(ch);
             }
         }
 
-        name
+        Some((name, name_start, name_end))
     } else {
-        value
+        let name_end = value
             .split_once('#')
             .map_or(value, |(before_comment, _)| before_comment)
             .trim_end()
-            .to_string()
+            .len();
+        let name = value[..name_end].to_string();
+        Some((name, 0, name_end))
     }
+}
+
+fn find_best_field_for_schema_name(
+    evaluations: &[FieldEval],
+    schema_name: &str,
+) -> Option<ClickedField> {
+    let normalized_schema_name = strip_repeat_indexes(schema_name);
+    if normalized_schema_name.is_empty() {
+        return None;
+    }
+
+    evaluations
+        .iter()
+        .find(|eval| normalized_leaf_name(&eval.field.name) == normalized_schema_name)
+        .or_else(|| {
+            evaluations
+                .iter()
+                .find(|eval| strip_repeat_indexes(&eval.display_name) == normalized_schema_name)
+        })
+        .or_else(|| {
+            evaluations
+                .iter()
+                .find(|eval| normalized_leaf_name(&eval.display_name) == normalized_schema_name)
+        })
+        .map(clicked_field_from_eval)
+}
+
+fn clicked_field_from_eval(eval: &FieldEval) -> ClickedField {
+    ClickedField {
+        display_name: eval.display_name.clone(),
+        schema_field_name: eval.field.name.clone(),
+        offset: eval.resolved_offset,
+        byte_len: eval.byte_len,
+        offset_valid: eval.offset_valid,
+    }
+}
+
+fn normalized_leaf_name(name: &str) -> String {
+    let normalized = strip_repeat_indexes(name);
+    normalized
+        .rsplit_once('.')
+        .map_or(normalized.as_str(), |(_, leaf)| leaf)
+        .to_string()
 }
 
 fn runtime_diagnostic_from_field_eval(eval: &FieldEval) -> Option<GuiDiagnostic> {
@@ -1296,11 +1486,14 @@ fn draw_field_table(
     ui: &mut egui::Ui,
     items: &[FieldTableItem<'_>],
     collapsed_groups: &mut HashSet<String>,
+    selected_name: Option<&str>,
     selected_range: Option<(u64, usize)>,
+    scroll_selected_row: bool,
     available_width: f32,
-) -> (Option<ClickedField>, Vec<egui::Rect>) {
+) -> (Option<ClickedField>, Vec<egui::Rect>, bool) {
     let mut clicked_field = None;
     let mut row_rects = Vec::new();
+    let mut did_scroll_to_selected_row = false;
     let spacing_x = ui.spacing().item_spacing.x;
     let name_column_width = (available_width * 0.22).clamp(120.0, 220.0);
     let offset_column_width = 104.0;
@@ -1348,16 +1541,19 @@ fn draw_field_table(
             for item in items {
                 match item {
                     FieldTableItem::Ungrouped(eval) => {
-                        let (field, row_rect) = draw_field_eval_row(
+                        let (field, row_rect, did_scroll) = draw_field_eval_row(
                             ui,
                             eval,
                             &eval.display_name,
+                            selected_name,
                             selected_range,
+                            scroll_selected_row,
                             &widths,
                         );
                         if let Some(field) = field {
                             clicked_field = Some(field);
                         }
+                        did_scroll_to_selected_row |= did_scroll;
                         row_rects.push(row_rect);
                     }
                     FieldTableItem::Group { name, children } => {
@@ -1379,16 +1575,19 @@ fn draw_field_table(
 
                         if !collapsed {
                             for child in children {
-                                let (field, row_rect) = draw_field_eval_row(
+                                let (field, row_rect, did_scroll) = draw_field_eval_row(
                                     ui,
                                     child.eval,
                                     &format!("    {}", child.name),
+                                    selected_name,
                                     selected_range,
+                                    scroll_selected_row,
                                     &widths,
                                 );
                                 if let Some(field) = field {
                                     clicked_field = Some(field);
                                 }
+                                did_scroll_to_selected_row |= did_scroll;
                                 row_rects.push(row_rect);
                             }
                         }
@@ -1397,7 +1596,7 @@ fn draw_field_table(
             }
         });
 
-    (clicked_field, row_rects)
+    (clicked_field, row_rects, did_scroll_to_selected_row)
 }
 
 fn draw_field_group_row(
@@ -1438,11 +1637,16 @@ fn draw_field_eval_row(
     ui: &mut egui::Ui,
     eval: &FieldEval,
     display_name: &str,
+    selected_name: Option<&str>,
     selected_range: Option<(u64, usize)>,
+    scroll_selected_row: bool,
     widths: &FieldTableWidths,
-) -> (Option<ClickedField>, egui::Rect) {
-    let is_selected =
+) -> (Option<ClickedField>, egui::Rect, bool) {
+    let is_selected_by_range =
         selected_range.is_some_and(|selected| selected == (eval.resolved_offset, eval.byte_len));
+    let is_selected_by_name =
+        selected_name.is_some_and(|selected| selected == eval.display_name.as_str());
+    let is_selected = is_selected_by_range || is_selected_by_name;
     let mut row_clicked = false;
 
     let response = ui.add_sized(
@@ -1510,6 +1714,10 @@ fn draw_field_eval_row(
 
     ui.end_row();
     let row_rect = row_rect.expand2(egui::vec2(ui.spacing().item_spacing.x, 0.0));
+    let did_scroll_to_selected_row = scroll_selected_row && is_selected_by_name;
+    if did_scroll_to_selected_row {
+        ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+    }
 
     if row_clicked && eval.offset_valid {
         eprintln!(
@@ -1522,11 +1730,13 @@ fn draw_field_eval_row(
                 schema_field_name: eval.field.name.clone(),
                 offset: eval.resolved_offset,
                 byte_len: eval.byte_len,
+                offset_valid: eval.offset_valid,
             }),
             row_rect,
+            did_scroll_to_selected_row,
         )
     } else {
-        (None, row_rect)
+        (None, row_rect, did_scroll_to_selected_row)
     }
 }
 
@@ -1984,6 +2194,8 @@ fn draw_fields_pane(
             align_cursor_to(ui, table_top);
             let max_height = ui.available_height().max(120.0);
             let table_width = ui.available_width();
+            let selected_name = doc.selected_field_name.clone();
+            let scroll_selected_row = doc.selected_field_scroll_pending;
             let table_output = egui::ScrollArea::both()
                 .id_source("field_table_scroll_area")
                 .max_width(table_width)
@@ -1996,12 +2208,17 @@ fn draw_fields_pane(
                         ui,
                         &field_items,
                         &mut doc.collapsed_field_groups,
+                        selected_name.as_deref(),
                         doc.selected_field_range,
+                        scroll_selected_row,
                         table_width,
                     )
                 });
             protected_rects.push(table_output.inner_rect.expand(4.0));
             protected_rects.extend(table_output.inner.1);
+            if table_output.inner.2 {
+                doc.selected_field_scroll_pending = false;
+            }
             table_output.inner.0
         }
     } else {
@@ -2140,7 +2357,7 @@ fn schema_editor_layout_job(
     ui: &egui::Ui,
     text: &str,
     wrap_width: f32,
-    highlighted_line: Option<(usize, usize, usize)>,
+    highlighted_range: Option<(usize, usize)>,
 ) -> Arc<egui::Galley> {
     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
     let text_color = ui.visuals().text_color();
@@ -2155,15 +2372,15 @@ fn schema_editor_layout_job(
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap_width;
 
-    if let Some((_, line_start, line_end)) = highlighted_line {
-        if line_start <= line_end
-            && line_end <= text.len()
-            && text.is_char_boundary(line_start)
-            && text.is_char_boundary(line_end)
+    if let Some((highlight_start, highlight_end)) = highlighted_range {
+        if highlight_start <= highlight_end
+            && highlight_end <= text.len()
+            && text.is_char_boundary(highlight_start)
+            && text.is_char_boundary(highlight_end)
         {
-            job.append(&text[..line_start], 0.0, base_format.clone());
-            job.append(&text[line_start..line_end], 0.0, highlight_format);
-            job.append(&text[line_end..], 0.0, base_format);
+            job.append(&text[..highlight_start], 0.0, base_format.clone());
+            job.append(&text[highlight_start..highlight_end], 0.0, highlight_format);
+            job.append(&text[highlight_end..], 0.0, base_format);
         } else {
             job.append(text, 0.0, base_format);
         }
@@ -2257,13 +2474,20 @@ fn draw_schema_pane(
             HEX_VIEW_HEIGHT
         };
         let source_width = ui.available_width();
-        let highlighted_line = doc.schema_match.as_ref().map(|schema_match| {
+        let schema_match_highlight = doc.schema_match.as_ref().map(|schema_match| {
             (
                 schema_match.line,
                 schema_match.line_start_byte,
                 schema_match.line_end_byte,
             )
         });
+        let highlighted_range = doc
+            .schema_cursor_name_highlight
+            .as_ref()
+            .map(|highlight| (highlight.start_byte, highlight.end_byte))
+            .or_else(|| {
+                schema_match_highlight.map(|(_, start_byte, end_byte)| (start_byte, end_byte))
+            });
         let mut did_scroll_to_schema_match = false;
         let scroll_to_schema_match = doc.schema_match_scroll_pending;
 
@@ -2275,7 +2499,8 @@ fn draw_schema_pane(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_width(source_width);
-                if let (true, Some((line, _, _))) = (scroll_to_schema_match, highlighted_line) {
+                if let (true, Some((line, _, _))) = (scroll_to_schema_match, schema_match_highlight)
+                {
                     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
                     let content_origin = ui.cursor().min;
                     let line_top = content_origin.y + row_height * line.saturating_sub(1) as f32;
@@ -2288,18 +2513,37 @@ fn draw_schema_pane(
                 }
 
                 let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
-                    schema_editor_layout_job(ui, text, wrap_width, highlighted_line)
+                    schema_editor_layout_job(ui, text, wrap_width, highlighted_range)
                 };
-                let response = ui.add_sized(
-                    [source_width, max_height],
-                    egui::TextEdit::multiline(&mut doc.schema_editor_text)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(source_width)
-                        .layouter(&mut layouter),
-                );
-                if response.changed() {
+                let desired_rows = doc.schema_editor_text.lines().count().max(4);
+                let output = egui::TextEdit::multiline(&mut doc.schema_editor_text)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(source_width)
+                    .desired_rows(desired_rows)
+                    .min_size(egui::vec2(source_width, max_height))
+                    .layouter(&mut layouter)
+                    .show(ui);
+                let cursor_char_index = output
+                    .cursor_range
+                    .map(|cursor_range| cursor_range.primary.ccursor.index);
+                let cursor_moved = match (doc.schema_editor_cursor_char_index, cursor_char_index) {
+                    (Some(previous), Some(current)) => previous != current,
+                    _ => false,
+                };
+                doc.schema_editor_cursor_char_index = cursor_char_index;
+
+                if output.response.changed() {
                     doc.schema_editor_dirty = true;
                     doc.clear_schema_match();
+                    doc.clear_schema_cursor_name_highlight();
+                    doc.selected_field_scroll_pending = false;
+                } else if output.response.clicked() || (output.response.has_focus() && cursor_moved)
+                {
+                    if let Some(cursor_char_index) = cursor_char_index {
+                        let line_index =
+                            line_index_for_char_index(&doc.schema_editor_text, cursor_char_index);
+                        doc.activate_schema_editor_cursor_line(line_index);
+                    }
                 }
             });
         protected_rects.push(source_output.inner_rect.expand(4.0));
@@ -2437,10 +2681,13 @@ mod tests {
             active_schema_diagnostic: None,
             schema_match: None,
             schema_match_scroll_pending: false,
+            schema_cursor_name_highlight: None,
+            schema_editor_cursor_char_index: None,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
             selected_field_name: None,
+            selected_field_scroll_pending: false,
             search_query: String::new(),
             search_mode: SearchMode::Ascii,
             active_search_query: String::new(),
@@ -2455,9 +2702,18 @@ mod tests {
     }
 
     fn field_eval(display_name: &str, error: Option<&str>) -> FieldEval {
+        field_eval_with_schema_name(display_name, display_name, 0, error)
+    }
+
+    fn field_eval_with_schema_name(
+        display_name: &str,
+        schema_name: &str,
+        offset: u64,
+        error: Option<&str>,
+    ) -> FieldEval {
         FieldEval {
             field: binocular_schema::ast::FieldDef {
-                name: display_name.to_string(),
+                name: schema_name.to_string(),
                 ty: binocular_schema::ast::FieldType::U8,
                 offset: binocular_schema::ast::OffsetKind::Absolute(0),
                 length: None,
@@ -2467,7 +2723,7 @@ mod tests {
                 when: None,
             },
             display_name: display_name.to_string(),
-            resolved_offset: 0,
+            resolved_offset: offset,
             offset_valid: true,
             byte_len: 1,
             value: None,
@@ -2596,6 +2852,150 @@ fields:
                 .map(|schema_match| schema_match.line),
             Some(3)
         );
+    }
+
+    #[test]
+    fn schema_field_name_detection_extracts_field_lines() {
+        assert_eq!(
+            parse_schema_name_entry("  - name: payload").map(|entry| entry.name),
+            Some("payload".to_string())
+        );
+        assert_eq!(
+            parse_schema_name_entry("name: \"payload\"").map(|entry| entry.name),
+            Some("payload".to_string())
+        );
+        assert_eq!(
+            parse_schema_name_entry("name: 'payload'").map(|entry| entry.name),
+            Some("payload".to_string())
+        );
+        assert_eq!(parse_schema_name_entry("schema_name: payload"), None);
+        assert_eq!(parse_schema_name_entry("  type: u8"), None);
+    }
+
+    #[test]
+    fn schema_field_name_detection_uses_cursor_line() {
+        let source = "schema_name: Test\nfields:\n  - name: payload\n    type: u8\n";
+        let cursor_index = source
+            .find("payload")
+            .expect("fixture should contain payload");
+        let line_index = line_index_for_char_index(source, cursor_index);
+
+        assert_eq!(line_index, 2);
+        assert_eq!(
+            schema_field_name_match_at_line(source, line_index).map(|entry| entry.name),
+            Some("payload".to_string())
+        );
+    }
+
+    #[test]
+    fn schema_field_name_detection_tracks_value_highlight_span() {
+        let source = "fields:\n  - name: \"payload\"\n  - name: 'id'\n";
+
+        let payload =
+            schema_field_name_match_at_line(source, 1).expect("quoted payload line should parse");
+        assert_eq!(payload.name, "payload");
+        assert_eq!(
+            &source[payload.highlight.start_byte..payload.highlight.end_byte],
+            "payload"
+        );
+
+        let id =
+            schema_field_name_match_at_line(source, 2).expect("single-quoted id line should parse");
+        assert_eq!(id.name, "id");
+        assert_eq!(
+            &source[id.highlight.start_byte..id.highlight.end_byte],
+            "id"
+        );
+    }
+
+    #[test]
+    fn schema_field_matching_prefers_schema_field_leaf() {
+        let evaluations = vec![
+            field_eval_with_schema_name("records[0].id", "id", 4, None),
+            field_eval_with_schema_name("header.id", "id", 8, None),
+        ];
+
+        let field = find_best_field_for_schema_name(&evaluations, "id")
+            .expect("id should match first repeated field");
+
+        assert_eq!(field.display_name, "records[0].id");
+        assert_eq!(field.offset, 4);
+    }
+
+    #[test]
+    fn schema_field_matching_uses_dotted_display_name() {
+        let evaluations = vec![
+            field_eval_with_schema_name("header.id", "id", 4, None),
+            field_eval_with_schema_name("records[0].id", "id", 8, None),
+        ];
+
+        let field = find_best_field_for_schema_name(&evaluations, "records.id")
+            .expect("dotted schema name should match normalized display name");
+
+        assert_eq!(field.display_name, "records[0].id");
+        assert_eq!(field.offset, 8);
+    }
+
+    #[test]
+    fn schema_field_matching_returns_none_for_missing_name() {
+        let evaluations = vec![field_eval_with_schema_name("payload", "payload", 4, None)];
+
+        assert!(find_best_field_for_schema_name(&evaluations, "missing").is_none());
+    }
+
+    #[test]
+    fn schema_cursor_activation_selects_matching_field_and_reveals_row() {
+        let mut doc = memory_doc(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+        doc.schema_editor_text = "fields:\n  - name: length\n".to_string();
+        doc.field_evaluations = Some(vec![
+            field_eval_with_schema_name("header.magic", "magic", 0, None),
+            field_eval_with_schema_name("header.length", "length", 3, None),
+        ]);
+        doc.field_filter_query = "magic".to_string();
+        doc.field_filter_errors_only = true;
+        doc.collapsed_field_groups.insert("header".to_string());
+
+        doc.activate_schema_editor_cursor_line(1);
+
+        assert_eq!(doc.selected_field_name.as_deref(), Some("header.length"));
+        assert_eq!(doc.selected_field_range, Some((3, 1)));
+        let highlight = doc
+            .schema_cursor_name_highlight
+            .as_ref()
+            .expect("schema-origin selection should highlight clicked name");
+        assert_eq!(
+            &doc.schema_editor_text[highlight.start_byte..highlight.end_byte],
+            "length"
+        );
+        assert!(doc.field_filter_query.is_empty());
+        assert!(!doc.field_filter_errors_only);
+        assert!(!doc.collapsed_field_groups.contains("header"));
+        assert!(doc.selected_field_scroll_pending);
+    }
+
+    #[test]
+    fn schema_cursor_activation_clears_stale_reverse_scroll_on_no_match() {
+        let mut doc = memory_doc(&[0xAA]);
+        doc.schema_editor_text = "fields:\n  - name: missing\n  type: u8\n".to_string();
+        doc.field_evaluations = Some(vec![field_eval_with_schema_name(
+            "payload", "payload", 0, None,
+        )]);
+        doc.selected_field_name = Some("payload".to_string());
+        doc.selected_field_range = Some((0, 1));
+        doc.selected_field_scroll_pending = true;
+
+        doc.activate_schema_editor_cursor_line(1);
+
+        assert_eq!(doc.selected_field_name.as_deref(), Some("payload"));
+        assert_eq!(doc.selected_field_range, Some((0, 1)));
+        assert!(doc.schema_cursor_name_highlight.is_none());
+        assert!(!doc.selected_field_scroll_pending);
+
+        doc.selected_field_scroll_pending = true;
+        doc.activate_schema_editor_cursor_line(2);
+        assert_eq!(doc.selected_field_name.as_deref(), Some("payload"));
+        assert!(doc.schema_cursor_name_highlight.is_none());
+        assert!(!doc.selected_field_scroll_pending);
     }
 
     #[test]
