@@ -10,7 +10,7 @@
     <img src="https://img.shields.io/github/v/release/bburd/BinOcular?label=release" alt="Latest release" />
   </a>
   <a href="https://github.com/bburd/BinOcular/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/bburd/BinOcular" alt="License" />
+    <img src="https://img.shields.io/github/license/bburd/BinOcular?cacheSeconds=3600" alt="License" />
   </a>
 </p>
 
