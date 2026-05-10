@@ -3,6 +3,7 @@ use std::{collections::HashSet, fs, path::PathBuf, sync::Arc};
 use binocular_core::buffer::{FileBuffer, MemoryBuffer, MmapBuffer};
 use binocular_core::interpret::{interpret_schema, FieldEval, FieldValue};
 use binocular_schema::ast::Schema;
+use binocular_schema::error::SchemaError;
 use binocular_schema::parser::parse_schema_str_with_base_path;
 use eframe::egui;
 
@@ -26,6 +27,56 @@ enum SearchMode {
     Hex,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticCategory {
+    SchemaParse,
+    SchemaValidation,
+    IncludeResolution,
+    Interpretation,
+    Search,
+}
+
+impl DiagnosticCategory {
+    fn label(self) -> &'static str {
+        match self {
+            DiagnosticCategory::SchemaParse => "Schema Parse",
+            DiagnosticCategory::SchemaValidation => "Schema Validation",
+            DiagnosticCategory::IncludeResolution => "Include",
+            DiagnosticCategory::Interpretation => "Interpretation",
+            DiagnosticCategory::Search => "Search",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceLocation {
+    path: PathBuf,
+    line: usize,
+    column: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiagnosticTarget {
+    Schema {
+        location: Option<SourceLocation>,
+    },
+    Field {
+        name: String,
+        offset: u64,
+        byte_len: usize,
+        offset_valid: bool,
+    },
+    Search,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GuiDiagnostic {
+    category: DiagnosticCategory,
+    message: String,
+    target: DiagnosticTarget,
+    snippet: Option<String>,
+}
+
 struct Document {
     _path: PathBuf,
     name: String,
@@ -39,6 +90,8 @@ struct Document {
     schema_editor_text: String,
     schema_editor_dirty: bool,
     schema_editor_error: Option<String>,
+    schema_diagnostics: Vec<GuiDiagnostic>,
+    active_schema_diagnostic: Option<usize>,
     hex_start_offset: u64,
     hex_offset_input: String,
     selected_field_range: Option<(u64, usize)>,
@@ -105,7 +158,20 @@ impl BinOcularApp {
         let schema_source_text = match fs::read_to_string(&path) {
             Ok(source_text) => source_text,
             Err(err) => {
-                doc.last_error = Some(format!("Failed to read schema source: {err}"));
+                let error = format!("Failed to read schema source: {err}");
+                doc.last_error = Some(error.clone());
+                doc.set_schema_diagnostic(GuiDiagnostic {
+                    category: DiagnosticCategory::IncludeResolution,
+                    message: error,
+                    target: DiagnosticTarget::Schema {
+                        location: Some(SourceLocation {
+                            path: path.clone(),
+                            line: 1,
+                            column: 1,
+                        }),
+                    },
+                    snippet: None,
+                });
                 doc.last_error_is_offset = false;
                 return;
             }
@@ -114,7 +180,11 @@ impl BinOcularApp {
         let schema = match parse_schema_str_with_base_path(&schema_source_text, &path) {
             Ok(schema) => schema,
             Err(err) => {
-                doc.last_error = Some(format!("Failed to parse or validate schema: {err}"));
+                let error = format!("Failed to parse or validate schema: {err}");
+                doc.last_error = Some(error);
+                let diagnostic =
+                    schema_error_diagnostic(&err, Some(&path), Some(&schema_source_text));
+                doc.set_schema_diagnostic(diagnostic);
                 doc.last_error_is_offset = false;
                 return;
             }
@@ -157,6 +227,8 @@ impl BinOcularApp {
             schema_editor_text: String::new(),
             schema_editor_dirty: false,
             schema_editor_error: None,
+            schema_diagnostics: Vec::new(),
+            active_schema_diagnostic: None,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
@@ -194,15 +266,32 @@ impl Document {
         self.field_evaluations = Some(evaluations);
         self.schema_editor_dirty = false;
         self.schema_editor_error = None;
+        self.clear_schema_diagnostics();
         self.last_error = None;
         self.last_error_is_offset = false;
         self.clear_selected_field();
     }
 
+    fn clear_schema_diagnostics(&mut self) {
+        self.schema_diagnostics.clear();
+        self.active_schema_diagnostic = None;
+    }
+
+    fn set_schema_diagnostic(&mut self, diagnostic: GuiDiagnostic) {
+        self.schema_diagnostics = vec![diagnostic];
+        self.active_schema_diagnostic = Some(0);
+    }
+
     fn apply_schema_editor(&mut self) {
         let Some(schema_path) = self.schema_path.clone() else {
-            self.schema_editor_error =
-                Some("No schema path available for Apply Schema".to_string());
+            let message = "No schema path available for Apply Schema".to_string();
+            self.schema_editor_error = Some(message.clone());
+            self.set_schema_diagnostic(GuiDiagnostic {
+                category: DiagnosticCategory::SchemaValidation,
+                message,
+                target: DiagnosticTarget::Schema { location: None },
+                snippet: None,
+            });
             return;
         };
 
@@ -211,6 +300,12 @@ impl Document {
             Err(err) => {
                 self.schema_editor_error =
                     Some(format!("Failed to parse or validate schema: {err}"));
+                let diagnostic = schema_error_diagnostic(
+                    &err,
+                    Some(&schema_path),
+                    Some(&self.schema_editor_text),
+                );
+                self.set_schema_diagnostic(diagnostic);
                 self.schema_editor_dirty = true;
             }
         }
@@ -218,7 +313,14 @@ impl Document {
 
     fn reload_schema_from_disk(&mut self) {
         let Some(schema_path) = self.schema_path.clone() else {
-            self.schema_editor_error = Some("No schema loaded to reload".to_string());
+            let message = "No schema loaded to reload".to_string();
+            self.schema_editor_error = Some(message.clone());
+            self.set_schema_diagnostic(GuiDiagnostic {
+                category: DiagnosticCategory::SchemaValidation,
+                message,
+                target: DiagnosticTarget::Schema { location: None },
+                snippet: None,
+            });
             return;
         };
 
@@ -227,6 +329,18 @@ impl Document {
             Err(err) => {
                 let error = format!("Failed to read schema source: {err}");
                 self.schema_editor_error = Some(error.clone());
+                self.set_schema_diagnostic(GuiDiagnostic {
+                    category: DiagnosticCategory::IncludeResolution,
+                    message: error.clone(),
+                    target: DiagnosticTarget::Schema {
+                        location: Some(SourceLocation {
+                            path: schema_path.clone(),
+                            line: 1,
+                            column: 1,
+                        }),
+                    },
+                    snippet: None,
+                });
                 self.last_error = Some(error);
                 self.last_error_is_offset = false;
                 return;
@@ -243,10 +357,84 @@ impl Document {
                 self.schema_editor_text = schema_source_text;
                 self.schema_editor_dirty = false;
                 self.schema_editor_error = Some(error.clone());
+                let diagnostic = schema_error_diagnostic(
+                    &err,
+                    Some(&schema_path),
+                    Some(&self.schema_editor_text),
+                );
+                self.set_schema_diagnostic(diagnostic);
                 self.last_error = Some(error);
                 self.last_error_is_offset = false;
             }
         }
+    }
+
+    fn diagnostics(&self) -> Vec<GuiDiagnostic> {
+        let mut diagnostics = self.schema_diagnostics.clone();
+
+        if let Some(evaluations) = self.field_evaluations.as_ref() {
+            diagnostics.extend(
+                evaluations
+                    .iter()
+                    .filter_map(runtime_diagnostic_from_field_eval),
+            );
+        }
+
+        if let Some(error) = self.search_error.as_ref() {
+            diagnostics.push(GuiDiagnostic {
+                category: DiagnosticCategory::Search,
+                message: error.clone(),
+                target: DiagnosticTarget::Search,
+                snippet: None,
+            });
+        }
+
+        diagnostics
+    }
+
+    fn diagnostic_count(&self) -> usize {
+        self.schema_diagnostics.len()
+            + self
+                .field_evaluations
+                .as_ref()
+                .map(|evaluations| {
+                    evaluations
+                        .iter()
+                        .filter(|eval| eval.error.is_some())
+                        .count()
+                })
+                .unwrap_or(0)
+            + usize::from(self.search_error.is_some())
+    }
+
+    fn activate_runtime_diagnostic(
+        &mut self,
+        name: &str,
+        offset: u64,
+        byte_len: usize,
+        offset_valid: bool,
+    ) {
+        if let Some((group, _)) = split_field_group(name) {
+            self.collapsed_field_groups.remove(group);
+        }
+
+        if !field_name_matches_filter(name, &self.field_filter_query) {
+            self.field_filter_query.clear();
+        }
+        self.field_filter_errors_only = false;
+        if offset_valid {
+            self.select_field(name.to_string(), offset, byte_len);
+        } else {
+            self.selected_field_name = Some(name.to_string());
+            self.selected_field_range = None;
+        }
+    }
+
+    fn activate_schema_diagnostic(&mut self, diagnostic: &GuiDiagnostic) {
+        self.active_schema_diagnostic = self
+            .schema_diagnostics
+            .iter()
+            .position(|existing| existing == diagnostic);
     }
 
     fn read_bytes(&self, offset: u64, len: usize) -> Option<&[u8]> {
@@ -690,19 +878,144 @@ fn format_ascii_preview(text: &str, byte_len: usize) -> String {
     format!("{preview}... ({byte_len} bytes)")
 }
 
+fn schema_error_diagnostic(
+    error: &SchemaError,
+    fallback_path: Option<&PathBuf>,
+    fallback_source: Option<&str>,
+) -> GuiDiagnostic {
+    match error {
+        SchemaError::Yaml { message, location } => {
+            let source_location = source_location(fallback_path.cloned(), location.as_ref());
+            let snippet = source_location
+                .as_ref()
+                .and_then(|location| schema_snippet(location, fallback_path, fallback_source));
+            GuiDiagnostic {
+                category: DiagnosticCategory::SchemaParse,
+                message: message.clone(),
+                target: DiagnosticTarget::Schema {
+                    location: source_location,
+                },
+                snippet,
+            }
+        }
+        SchemaError::Validation {
+            message,
+            path,
+            location,
+        } => {
+            let source_location = source_location(
+                path.clone().or_else(|| fallback_path.cloned()),
+                location.as_ref(),
+            );
+            let snippet = source_location
+                .as_ref()
+                .and_then(|location| schema_snippet(location, fallback_path, fallback_source));
+            GuiDiagnostic {
+                category: DiagnosticCategory::SchemaValidation,
+                message: message.clone(),
+                target: DiagnosticTarget::Schema {
+                    location: source_location,
+                },
+                snippet,
+            }
+        }
+        SchemaError::Io { path, .. } => GuiDiagnostic {
+            category: DiagnosticCategory::IncludeResolution,
+            message: error.to_string(),
+            target: DiagnosticTarget::Schema {
+                location: Some(SourceLocation {
+                    path: path.clone(),
+                    line: 1,
+                    column: 1,
+                }),
+            },
+            snippet: None,
+        },
+        SchemaError::IncludeCycle { .. } => GuiDiagnostic {
+            category: DiagnosticCategory::IncludeResolution,
+            message: error.to_string(),
+            target: DiagnosticTarget::Schema { location: None },
+            snippet: None,
+        },
+    }
+}
+
+fn source_location(
+    path: Option<PathBuf>,
+    location: Option<&binocular_schema::error::SchemaLocation>,
+) -> Option<SourceLocation> {
+    let path = path?;
+    let location = location?;
+    Some(SourceLocation {
+        path,
+        line: location.line,
+        column: location.column,
+    })
+}
+
+fn schema_snippet(
+    location: &SourceLocation,
+    fallback_path: Option<&PathBuf>,
+    fallback_source: Option<&str>,
+) -> Option<String> {
+    let source = if fallback_path.is_some_and(|path| path == &location.path) {
+        fallback_source.map(str::to_string)
+    } else {
+        fs::read_to_string(&location.path).ok()
+    }?;
+
+    source_snippet(&source, location.line)
+}
+
+fn source_snippet(source: &str, line: usize) -> Option<String> {
+    if line == 0 {
+        return None;
+    }
+
+    let lines = source.lines().collect::<Vec<_>>();
+    if lines.is_empty() || line > lines.len() {
+        return None;
+    }
+
+    let start = line.saturating_sub(2).max(1);
+    let end = (line + 2).min(lines.len());
+    let mut snippet = Vec::new();
+
+    for current_line in start..=end {
+        let marker = if current_line == line { ">" } else { " " };
+        let text = lines[current_line - 1];
+        snippet.push(format!("{marker} {current_line:>4} | {text}"));
+    }
+
+    Some(snippet.join("\n"))
+}
+
+fn runtime_diagnostic_from_field_eval(eval: &FieldEval) -> Option<GuiDiagnostic> {
+    let error = eval.error.as_ref()?;
+    Some(GuiDiagnostic {
+        category: DiagnosticCategory::Interpretation,
+        message: error.clone(),
+        target: DiagnosticTarget::Field {
+            name: eval.display_name.clone(),
+            offset: eval.resolved_offset,
+            byte_len: eval.byte_len,
+            offset_valid: eval.offset_valid,
+        },
+        snippet: None,
+    })
+}
+
+fn field_name_matches_filter(display_name: &str, query: &str) -> bool {
+    let query = query.trim();
+    query.is_empty() || display_name.to_lowercase().contains(&query.to_lowercase())
+}
+
 fn field_matches_filter(eval: &FieldEval, query: &str, errors_only: bool) -> bool {
     if errors_only && eval.error.is_none() {
         return false;
     }
 
-    let query = query.trim();
-    if query.is_empty() {
-        return true;
-    }
-
-    eval.display_name
-        .to_lowercase()
-        .contains(&query.to_lowercase())
+    field_name_matches_filter(&eval.display_name, query)
 }
 
 struct FieldTableWidths {
@@ -1366,7 +1679,9 @@ fn draw_search_controls(ui: &mut egui::Ui, doc: &mut Document) -> egui::Response
                     }
                 }
                 Err(err) => {
-                    doc.last_error = Some(format!("Search failed: {err}"));
+                    let error = format!("Search failed: {err}");
+                    doc.search_error = Some(error.clone());
+                    doc.last_error = Some(error);
                     doc.last_error_is_offset = false;
                 }
             }
@@ -1501,6 +1816,124 @@ fn draw_fields_pane(
     }
 }
 
+fn draw_diagnostics_panel(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    protected_rects: &mut Vec<egui::Rect>,
+) {
+    let diagnostics = doc.diagnostics();
+    if diagnostics.is_empty() {
+        return;
+    }
+
+    ui.separator();
+    let header = ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Diagnostics").strong());
+        ui.label(diagnostic_summary(&diagnostics));
+    });
+    protected_rects.push(header.response.rect);
+
+    let mut clicked_diagnostic = None;
+    let panel_width = ui.available_width();
+    let output = egui::ScrollArea::vertical()
+        .id_source("diagnostics_scroll_area")
+        .max_height(150.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.set_width(panel_width);
+            for diagnostic in &diagnostics {
+                let text = format!(
+                    "{} - {}{}",
+                    diagnostic.category.label(),
+                    diagnostic.message,
+                    diagnostic_target_suffix(diagnostic)
+                );
+                let response = ui.add_sized(
+                    [panel_width, ui.spacing().interact_size.y],
+                    egui::SelectableLabel::new(false, text),
+                );
+                if response.clicked() {
+                    clicked_diagnostic = Some(diagnostic.clone());
+                }
+            }
+        });
+    protected_rects.push(output.inner_rect.expand(4.0));
+
+    if let Some(diagnostic) = clicked_diagnostic {
+        match &diagnostic.target {
+            DiagnosticTarget::Field {
+                name,
+                offset,
+                byte_len,
+                offset_valid,
+            } => doc.activate_runtime_diagnostic(name, *offset, *byte_len, *offset_valid),
+            DiagnosticTarget::Schema { .. } => doc.activate_schema_diagnostic(&diagnostic),
+            DiagnosticTarget::Search => {}
+        }
+    }
+
+    if let Some(active_index) = doc.active_schema_diagnostic {
+        if let Some(diagnostic) = doc.schema_diagnostics.get(active_index) {
+            let active = ui.group(|ui| {
+                if let DiagnosticTarget::Schema {
+                    location: Some(location),
+                } = &diagnostic.target
+                {
+                    ui.label(format!(
+                        "{}:{}:{}",
+                        location.path.display(),
+                        location.line,
+                        location.column
+                    ));
+                }
+                if let Some(snippet) = diagnostic.snippet.as_ref() {
+                    ui.monospace(snippet);
+                } else {
+                    ui.label("No source snippet available.");
+                }
+            });
+            protected_rects.push(active.response.rect);
+        }
+    }
+}
+
+fn diagnostic_summary(diagnostics: &[GuiDiagnostic]) -> String {
+    let mut parts = Vec::new();
+    for category in [
+        DiagnosticCategory::SchemaParse,
+        DiagnosticCategory::SchemaValidation,
+        DiagnosticCategory::IncludeResolution,
+        DiagnosticCategory::Interpretation,
+        DiagnosticCategory::Search,
+    ] {
+        let count = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.category == category)
+            .count();
+        if count > 0 {
+            parts.push(format!("{} {count}", category.label()));
+        }
+    }
+
+    format!("{} errors ({})", diagnostics.len(), parts.join(", "))
+}
+
+fn diagnostic_target_suffix(diagnostic: &GuiDiagnostic) -> String {
+    match &diagnostic.target {
+        DiagnosticTarget::Schema {
+            location: Some(location),
+        } => format!(
+            " [{}:{}:{}]",
+            location.path.display(),
+            location.line,
+            location.column
+        ),
+        DiagnosticTarget::Schema { location: None } => String::new(),
+        DiagnosticTarget::Field { name, .. } => format!(" [{name}]"),
+        DiagnosticTarget::Search => String::new(),
+    }
+}
+
 fn draw_schema_pane(
     ui: &mut egui::Ui,
     doc: &mut Document,
@@ -1562,8 +1995,13 @@ fn draw_schema_pane(
     }
 
     if !doc.schema_editor_text.is_empty() || doc.schema_path.is_some() {
+        let diagnostics_reserved_height = if doc.diagnostic_count() > 0 {
+            190.0
+        } else {
+            0.0
+        };
         let max_height = if fill_available_height {
-            ui.available_height().max(120.0)
+            (ui.available_height() - diagnostics_reserved_height).max(120.0)
         } else {
             HEX_VIEW_HEIGHT
         };
@@ -1591,6 +2029,8 @@ fn draw_schema_pane(
     } else {
         protected_rects.push(ui.label("No schema loaded").rect);
     }
+
+    draw_diagnostics_panel(ui, doc, protected_rects);
 }
 
 impl eframe::App for BinOcularApp {
@@ -1652,11 +2092,20 @@ impl eframe::App for BinOcularApp {
                 .and_then(|index| self.documents.get(index))
                 .map(|doc| doc.name.clone())
                 .unwrap_or_else(|| "No file open".to_string());
+            let diagnostics_status = self
+                .current_doc
+                .and_then(|index| self.documents.get(index))
+                .map(Document::diagnostic_count)
+                .filter(|count| *count > 0)
+                .map(|count| format!("Diagnostics: {count} errors"));
 
             ui.with_layout(
                 egui::Layout::left_to_right(egui::Align::Center).with_main_justify(true),
                 |ui| {
                     ui.label(status_left);
+                    if let Some(status) = diagnostics_status {
+                        ui.label(status);
+                    }
                     ui.label("BinOcular pre-alpha");
                 },
             );
@@ -1704,6 +2153,8 @@ mod tests {
             schema_editor_text: String::new(),
             schema_editor_dirty: false,
             schema_editor_error: None,
+            schema_diagnostics: Vec::new(),
+            active_schema_diagnostic: None,
             hex_start_offset: 0,
             hex_offset_input: "0x0".to_string(),
             selected_field_range: None,
@@ -1786,6 +2237,13 @@ fields:
         doc.schema_editor_text = schema_yaml("renamed", 0);
         doc.schema_editor_dirty = true;
         doc.schema_editor_error = Some("old error".to_string());
+        doc.schema_diagnostics.push(GuiDiagnostic {
+            category: DiagnosticCategory::SchemaParse,
+            message: "old diagnostic".to_string(),
+            target: DiagnosticTarget::Schema { location: None },
+            snippet: None,
+        });
+        doc.active_schema_diagnostic = Some(0);
         doc.selected_field_range = Some((0, 1));
         doc.selected_field_name = Some("old".to_string());
 
@@ -1794,6 +2252,8 @@ fields:
         assert_eq!(evaluation_names(&doc), vec!["renamed"]);
         assert!(!doc.schema_editor_dirty);
         assert!(doc.schema_editor_error.is_none());
+        assert!(doc.schema_diagnostics.is_empty());
+        assert_eq!(doc.active_schema_diagnostic, None);
         assert!(doc.selected_field_range.is_none());
         assert!(doc.selected_field_name.is_none());
     }
@@ -1816,6 +2276,19 @@ fields:
         assert!(doc.schema_editor_error.is_some());
         assert_eq!(doc.selected_field_range, Some((0, 1)));
         assert_eq!(doc.selected_field_name.as_deref(), Some("good"));
+        assert_eq!(doc.schema_diagnostics.len(), 1);
+        assert_eq!(
+            doc.schema_diagnostics[0].category,
+            DiagnosticCategory::SchemaParse
+        );
+        assert!(matches!(
+            doc.schema_diagnostics[0].target,
+            DiagnosticTarget::Schema { location: Some(_) }
+        ));
+        assert!(doc.schema_diagnostics[0]
+            .snippet
+            .as_deref()
+            .is_some_and(|snippet| snippet.contains(">    1 | schema_name: [")));
     }
 
     #[test]
@@ -1836,8 +2309,61 @@ fields:
         assert_eq!(evaluation_names(&doc), vec!["from_disk"]);
         assert!(!doc.schema_editor_dirty);
         assert!(doc.schema_editor_error.is_none());
+        assert!(doc.schema_diagnostics.is_empty());
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_schema_from_disk_failure_records_diagnostic_and_preserves_results() {
+        let mut doc = memory_doc(&[0x12]);
+        doc.schema_path = Some(unique_temp_path("reload_missing", "yaml"));
+        doc.schema_editor_text = schema_yaml("good", 0);
+        doc.apply_schema_editor();
+
+        doc.reload_schema_from_disk();
+
+        assert_eq!(evaluation_names(&doc), vec!["good"]);
+        assert!(doc.schema_editor_error.is_some());
+        assert_eq!(doc.schema_diagnostics.len(), 1);
+        assert_eq!(
+            doc.schema_diagnostics[0].category,
+            DiagnosticCategory::IncludeResolution
+        );
+    }
+
+    #[test]
+    fn runtime_field_errors_are_collected_as_diagnostics() {
+        let mut doc = memory_doc(&[0x12]);
+        doc.field_evaluations = Some(vec![
+            field_eval("header.magic", None),
+            field_eval("header.length", Some("read out of bounds")),
+        ]);
+
+        let diagnostics = doc.diagnostics();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].category, DiagnosticCategory::Interpretation);
+        assert!(matches!(
+            &diagnostics[0].target,
+            DiagnosticTarget::Field { name, .. } if name == "header.length"
+        ));
+    }
+
+    #[test]
+    fn activating_runtime_diagnostic_expands_group_and_clears_hiding_filters() {
+        let mut doc = memory_doc(&[0x12]);
+        doc.field_filter_query = "payload".to_string();
+        doc.field_filter_errors_only = true;
+        doc.collapsed_field_groups.insert("header".to_string());
+
+        doc.activate_runtime_diagnostic("header.length", 0, 1, true);
+
+        assert!(!doc.collapsed_field_groups.contains("header"));
+        assert!(doc.field_filter_query.is_empty());
+        assert!(!doc.field_filter_errors_only);
+        assert_eq!(doc.selected_field_name.as_deref(), Some("header.length"));
+        assert_eq!(doc.selected_field_range, Some((0, 1)));
     }
 
     fn matching_names<'a>(
@@ -2217,5 +2743,12 @@ fields:
             .search_error
             .as_deref()
             .is_some_and(|error| error.contains("unexpected character")));
+        let diagnostics = doc.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].category, DiagnosticCategory::Search);
+
+        doc.clear_search();
+
+        assert!(doc.diagnostics().is_empty());
     }
 }

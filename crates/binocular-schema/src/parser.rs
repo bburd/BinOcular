@@ -9,7 +9,7 @@ use crate::ast::{
     Endianness, FieldDef, FieldItem, FieldType, IntExpr, LengthSpec, OffsetKind, Schema,
     StructInstanceDef, StructureDef, WhenCondition, WhenOp,
 };
-use crate::error::SchemaError;
+use crate::error::{SchemaError, SchemaLocation};
 
 pub const MAX_REPEAT_COUNT: u64 = 10_000;
 
@@ -46,13 +46,13 @@ enum FieldOffsetContext {
 
 pub fn validate_schema(schema: &Schema) -> Result<(), SchemaError> {
     if schema.schema_name.trim().is_empty() {
-        return Err(SchemaError::Validation(
+        return Err(SchemaError::validation(
             "Schema name must not be empty".to_string(),
         ));
     }
 
     if schema.schema_version < 1 {
-        return Err(SchemaError::Validation(format!(
+        return Err(SchemaError::validation(format!(
             "Schema version must be at least 1 (found {})",
             schema.schema_version
         )));
@@ -81,20 +81,20 @@ fn validate_structures(schema: &Schema) -> Result<(), SchemaError> {
 
     for (idx, structure) in schema.structures.iter().enumerate() {
         if structure.name.trim().is_empty() {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                 "Structure #{idx} has an empty name"
             )));
         }
 
         if !names.insert(structure.name.as_str()) {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                 "Duplicate structure name `{}`",
                 structure.name
             )));
         }
 
         if structure.fields.is_empty() {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                 "Structure `{}` must contain at least one field",
                 structure.name
             )));
@@ -118,7 +118,7 @@ fn validate_field_def(
     fallback_label: &str,
 ) -> Result<(), SchemaError> {
     if field.name.trim().is_empty() {
-        return Err(SchemaError::Validation(format!(
+        return Err(SchemaError::validation(format!(
             "{fallback_label} has an empty name"
         )));
     }
@@ -128,40 +128,40 @@ fn validate_field_def(
     match &field.offset {
         OffsetKind::Absolute(_) => {
             if matches!(offset_context, FieldOffsetContext::StructChild) {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                         "{field_label} uses an absolute offset inside a structure; structure child offsets must be Relative"
                     )));
             }
         }
         OffsetKind::Relative(_) => {
             if matches!(offset_context, FieldOffsetContext::TopLevel) {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} uses a relative offset outside a structure"
                 )));
             }
         }
         OffsetKind::FieldRef(referenced) => {
             if matches!(offset_context, FieldOffsetContext::StructChild) {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                         "{field_label} uses a dynamic offset inside a structure; structure child offsets must be Relative"
                     )));
             }
 
             if referenced.trim().is_empty() {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} references an empty offset field name"
                 )));
             }
 
             if field.repeat.is_some() {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} cannot use dynamic offset together with repeat in schema v1"
                 )));
             }
         }
         OffsetKind::Expr(expr) => {
             if matches!(offset_context, FieldOffsetContext::StructChild) {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                         "{field_label} uses an expression offset inside a structure; structure child offsets must be Relative"
                     )));
             }
@@ -169,7 +169,7 @@ fn validate_field_def(
             validate_int_expr(expr, &field_label, "offset")?;
 
             if field.repeat.is_some() {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} cannot use dynamic offset together with repeat in schema v1"
                 )));
             }
@@ -178,18 +178,18 @@ fn validate_field_def(
 
     if let Some(repeat) = &field.repeat {
         if repeat.count == 0 {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                 "{field_label} has repeat count 0; count must be greater than 0"
             )));
         }
         if repeat.count > MAX_REPEAT_COUNT {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                 "{field_label} has repeat count {}; maximum supported count is {}",
                 repeat.count, MAX_REPEAT_COUNT
             )));
         }
         if repeat.stride.is_some() {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                     "{field_label} specifies repeat stride, but scalar repeated fields infer stride from field length"
                 )));
         }
@@ -203,18 +203,18 @@ fn validate_field_def(
         FieldType::Bytes | FieldType::Ascii => match &field.length {
             Some(LengthSpec::Literal(length)) if *length > 0 => {}
             Some(LengthSpec::Literal(_)) => {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} has length 0; length must be greater than 0"
                 )))
             }
             Some(LengthSpec::FieldRef { field: referenced }) => {
                 if referenced.trim().is_empty() {
-                    return Err(SchemaError::Validation(format!(
+                    return Err(SchemaError::validation(format!(
                         "{field_label} references an empty length field name"
                     )));
                 }
                 if field.repeat.is_some() {
-                    return Err(SchemaError::Validation(format!(
+                    return Err(SchemaError::validation(format!(
                         "{field_label} cannot use dynamic length together with repeat in schema v1"
                     )));
                 }
@@ -223,13 +223,13 @@ fn validate_field_def(
                 validate_int_expr(expr, &field_label, "length")?;
 
                 if field.repeat.is_some() {
-                    return Err(SchemaError::Validation(format!(
+                    return Err(SchemaError::validation(format!(
                         "{field_label} cannot use dynamic length together with repeat in schema v1"
                     )));
                 }
             }
             None => {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} must specify length for type {:?}",
                     field.ty
                 )))
@@ -237,7 +237,7 @@ fn validate_field_def(
         },
         _ => {
             if field.length.is_some() {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} specifies length but type {:?} does not support length",
                     field.ty
                 )));
@@ -254,7 +254,7 @@ fn validate_struct_instance(
     idx: usize,
 ) -> Result<(), SchemaError> {
     if instance.name.trim().is_empty() {
-        return Err(SchemaError::Validation(format!(
+        return Err(SchemaError::validation(format!(
             "Field item #{idx} has an empty struct instance name"
         )));
     }
@@ -262,7 +262,7 @@ fn validate_struct_instance(
     let field_label = format!("Struct instance `{}`", instance.name);
 
     if instance.struct_name.trim().is_empty() {
-        return Err(SchemaError::Validation(format!(
+        return Err(SchemaError::validation(format!(
             "{field_label} references an empty structure name"
         )));
     }
@@ -272,7 +272,7 @@ fn validate_struct_instance(
         .iter()
         .any(|structure| structure.name == instance.struct_name)
     {
-        return Err(SchemaError::Validation(format!(
+        return Err(SchemaError::validation(format!(
             "{field_label} references unknown structure `{}`",
             instance.struct_name
         )));
@@ -281,19 +281,19 @@ fn validate_struct_instance(
     match &instance.offset {
         OffsetKind::Absolute(_) => {}
         OffsetKind::Relative(_) => {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                 "{field_label} uses a relative offset outside a structure"
             )))
         }
         OffsetKind::FieldRef(referenced) => {
             if referenced.trim().is_empty() {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} references an empty offset field name"
                 )));
             }
 
             if instance.repeat.is_some() {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} cannot use dynamic offset together with repeat in schema v1"
                 )));
             }
@@ -302,7 +302,7 @@ fn validate_struct_instance(
             validate_int_expr(expr, &field_label, "offset")?;
 
             if instance.repeat.is_some() {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} cannot use dynamic offset together with repeat in schema v1"
                 )));
             }
@@ -311,25 +311,25 @@ fn validate_struct_instance(
 
     if let Some(repeat) = &instance.repeat {
         if repeat.count == 0 {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                 "{field_label} has repeat count 0; count must be greater than 0"
             )));
         }
         if repeat.count > MAX_REPEAT_COUNT {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                 "{field_label} has repeat count {}; maximum supported count is {}",
                 repeat.count, MAX_REPEAT_COUNT
             )));
         }
         match repeat.stride {
             Some(0) => {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} has repeat stride 0; stride must be greater than 0"
                 )))
             }
             Some(_) => {}
             None => {
-                return Err(SchemaError::Validation(format!(
+                return Err(SchemaError::validation(format!(
                     "{field_label} repeats a structure and must specify repeat stride"
                 )))
             }
@@ -348,14 +348,14 @@ fn validate_when_condition(
     field_label: &str,
 ) -> Result<(), SchemaError> {
     if condition.field.trim().is_empty() {
-        return Err(SchemaError::Validation(format!(
+        return Err(SchemaError::validation(format!(
             "{field_label} uses a condition with an empty field reference"
         )));
     }
 
     if let WhenOp::BitSet(bit) = condition.op {
         if bit > 63 {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                 "{field_label} uses bit_set index {bit}; maximum supported index is 63"
             )));
         }
@@ -369,7 +369,7 @@ fn validate_int_expr(expr: &IntExpr, field_label: &str, usage: &str) -> Result<(
         IntExpr::Const { .. } => Ok(()),
         IntExpr::FieldRef { field } => {
             if field.trim().is_empty() {
-                Err(SchemaError::Validation(format!(
+                Err(SchemaError::validation(format!(
                     "{field_label} references an empty {usage} expression field name"
                 )))
             } else {
@@ -386,7 +386,7 @@ fn validate_int_expr(expr: &IntExpr, field_label: &str, usage: &str) -> Result<(
 pub fn parse_schema_str(yaml: &str) -> Result<Schema, SchemaError> {
     let raw = parse_raw_schema_str(yaml)?;
     if contains_include(&raw) {
-        return Err(SchemaError::Validation(
+        return Err(SchemaError::validation(
             "Schema includes require file-based loading via parse_schema_file".to_string(),
         ));
     }
@@ -457,13 +457,14 @@ fn parse_schema_source_inner(
     stack.push(normalized.clone());
 
     let result = (|| {
-        let raw = parse_raw_schema_str(yaml)?;
+        let raw = parse_raw_schema_str(yaml).map_err(|err| err.with_path(normalized.clone()))?;
         let root_endianness = if stack.len() == 1 {
             raw.endianness
         } else {
             root_endianness
         };
-        validate_include_endianness(root_endianness, raw.endianness, &normalized)?;
+        validate_include_endianness(root_endianness, raw.endianness, &normalized)
+            .map_err(|err| err.with_path(normalized.clone()))?;
         let base_dir = normalized
             .parent()
             .map(Path::to_path_buf)
@@ -491,7 +492,7 @@ fn parse_schema_source_inner(
             structures,
             fields,
         };
-        validate_schema(&schema)?;
+        validate_schema(&schema).map_err(|err| err.with_path(normalized.clone()))?;
         Ok(schema)
     })();
 
@@ -500,8 +501,7 @@ fn parse_schema_source_inner(
 }
 
 fn parse_raw_schema_str(yaml: &str) -> Result<RawSchema, SchemaError> {
-    let raw_doc: RawSchemaDoc =
-        serde_yaml::from_str(yaml).map_err(|e| SchemaError::Yaml(e.to_string()))?;
+    let raw_doc: RawSchemaDoc = serde_yaml::from_str(yaml).map_err(schema_yaml_error)?;
 
     let fields = raw_doc
         .fields
@@ -520,18 +520,21 @@ fn parse_raw_schema_str(yaml: &str) -> Result<RawSchema, SchemaError> {
 
 fn parse_raw_field_item(value: Value) -> Result<RawFieldItem, SchemaError> {
     let mapping = value.as_mapping().ok_or_else(|| {
-        SchemaError::Yaml("invalid type: expected a mapping for each field item".to_string())
+        SchemaError::yaml(
+            "invalid type: expected a mapping for each field item".to_string(),
+            None,
+        )
     })?;
 
     if let Some(include_value) = find_string_key(mapping, "include") {
         if mapping.len() != 1 {
-            return Err(SchemaError::Validation(
+            return Err(SchemaError::validation(
                 "Include items must contain exactly one key: `include`".to_string(),
             ));
         }
 
         if include_value.trim().is_empty() {
-            return Err(SchemaError::Validation(
+            return Err(SchemaError::validation(
                 "Include path must not be empty".to_string(),
             ));
         }
@@ -545,20 +548,27 @@ fn parse_raw_field_item(value: Value) -> Result<RawFieldItem, SchemaError> {
     let has_struct = mapping.contains_key(Value::String("struct".to_string()));
 
     if has_type && has_struct {
-        return Err(SchemaError::Validation(
+        return Err(SchemaError::validation(
             "Field items cannot specify both `type` and `struct`".to_string(),
         ));
     }
 
     if has_struct {
-        let instance = serde_yaml::from_value::<StructInstanceDef>(value)
-            .map_err(|e| SchemaError::Yaml(e.to_string()))?;
+        let instance =
+            serde_yaml::from_value::<StructInstanceDef>(value).map_err(schema_yaml_error)?;
         return Ok(RawFieldItem::FieldItem(FieldItem::StructInstance(instance)));
     }
 
-    let field =
-        serde_yaml::from_value::<FieldDef>(value).map_err(|e| SchemaError::Yaml(e.to_string()))?;
+    let field = serde_yaml::from_value::<FieldDef>(value).map_err(schema_yaml_error)?;
     Ok(RawFieldItem::FieldItem(FieldItem::Field(field)))
+}
+
+fn schema_yaml_error(error: serde_yaml::Error) -> SchemaError {
+    let location = error.location().map(|location| SchemaLocation {
+        line: location.line(),
+        column: location.column(),
+    });
+    SchemaError::yaml(error.to_string(), location)
 }
 
 fn contains_include(raw: &RawSchema) -> bool {
@@ -595,7 +605,7 @@ fn validate_include_endianness(
 ) -> Result<(), SchemaError> {
     if let (Some(root), Some(schema)) = (root_endianness, schema_endianness) {
         if root != schema {
-            return Err(SchemaError::Validation(format!(
+            return Err(SchemaError::validation(format!(
                 "Included schema `{}` declares {:?} endianness, but root schema declares {:?}; schema-level defaults must match for includes in v1",
                 path.display(),
                 schema,
@@ -828,9 +838,54 @@ fields:
         assert!(err.to_string().contains("file-based loading"));
     }
 
+    #[test]
+    fn parse_schema_str_preserves_yaml_error_location() {
+        let err = parse_schema_str("schema_name: [").unwrap_err();
+
+        match err {
+            SchemaError::Yaml {
+                message,
+                location: Some(location),
+            } => {
+                assert!(!message.is_empty());
+                assert_eq!(location.line, 1);
+                assert!(location.column > 0);
+            }
+            other => panic!("expected yaml error with location, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_schema_str_with_base_path_adds_validation_path_context() {
+        let dir = temp_test_dir("validation_path_context");
+        let yaml = r#"
+schema_name: "Root"
+schema_version: 1
+fields:
+  - name: "payload"
+    type: bytes
+    offset:
+      kind: Absolute
+      value: 0
+"#;
+
+        let err = parse_schema_str_with_base_path(yaml, dir.join("root.yaml")).unwrap_err();
+
+        match err {
+            SchemaError::Validation {
+                path: Some(path), ..
+            } => {
+                assert!(path.ends_with("root.yaml"));
+            }
+            other => panic!("expected validation error with path, got {other:?}"),
+        }
+
+        cleanup_test_dir(dir);
+    }
+
     fn expect_validation_error(yaml: &str) {
         match parse_schema_str(yaml) {
-            Err(SchemaError::Validation(_)) => {}
+            Err(SchemaError::Validation { .. }) => {}
             other => panic!("expected validation error, got {other:?}"),
         }
     }
@@ -1117,7 +1172,7 @@ fields:
 "#;
 
         let err = parse_schema_str(yaml).unwrap_err();
-        assert!(matches!(err, SchemaError::Yaml(_)));
+        assert!(matches!(err, SchemaError::Yaml { .. }));
         assert!(err.to_string().contains("exactly one"));
     }
 
@@ -1137,7 +1192,7 @@ fields:
 "#;
 
         let err = parse_schema_str(yaml).unwrap_err();
-        assert!(matches!(err, SchemaError::Yaml(_)));
+        assert!(matches!(err, SchemaError::Yaml { .. }));
         assert!(err.to_string().contains("multiple operators"));
     }
 
@@ -1156,7 +1211,7 @@ fields:
 "#;
 
         let err = parse_schema_str(yaml).unwrap_err();
-        assert!(matches!(err, SchemaError::Yaml(_)));
+        assert!(matches!(err, SchemaError::Yaml { .. }));
         assert!(err.to_string().contains("greater_than"));
     }
 
@@ -1175,7 +1230,7 @@ fields:
 "#;
 
         let err = parse_schema_str(yaml).unwrap_err();
-        assert!(matches!(err, SchemaError::Yaml(_)));
+        assert!(matches!(err, SchemaError::Yaml { .. }));
     }
 
     #[test]
@@ -1193,7 +1248,7 @@ fields:
 "#;
 
         let err = parse_schema_str(yaml).unwrap_err();
-        assert!(matches!(err, SchemaError::Validation(_)));
+        assert!(matches!(err, SchemaError::Validation { .. }));
         assert!(err.to_string().contains("maximum supported index is 63"));
     }
 
@@ -1322,7 +1377,7 @@ fields:
 "#;
 
         let err = parse_schema_str(yaml).unwrap_err();
-        assert!(matches!(err, SchemaError::Yaml(_)));
+        assert!(matches!(err, SchemaError::Yaml { .. }));
     }
 
     #[test]
@@ -1371,7 +1426,7 @@ fields:
 "#;
 
         let err = parse_schema_str(yaml).unwrap_err();
-        assert!(matches!(err, SchemaError::Yaml(_)));
+        assert!(matches!(err, SchemaError::Yaml { .. }));
     }
 
     #[test]
@@ -2015,7 +2070,7 @@ fields:
         );
 
         let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
-        assert!(matches!(err, SchemaError::Validation(_)));
+        assert!(matches!(err, SchemaError::Validation { .. }));
         assert!(err.to_string().contains("exactly one key"));
 
         cleanup_test_dir(dir);
@@ -2091,7 +2146,7 @@ fields:
         );
 
         let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
-        assert!(matches!(err, SchemaError::Validation(_)));
+        assert!(matches!(err, SchemaError::Validation { .. }));
         assert!(err.to_string().contains("repeat count 0"));
 
         cleanup_test_dir(dir);
@@ -2126,7 +2181,7 @@ fields:
         );
 
         let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
-        assert!(matches!(err, SchemaError::Yaml(_)));
+        assert!(matches!(err, SchemaError::Yaml { .. }));
 
         cleanup_test_dir(dir);
     }
@@ -2160,7 +2215,7 @@ fields:
         );
 
         let err = parse_schema_file(dir.join("root.yaml")).unwrap_err();
-        assert!(matches!(err, SchemaError::Validation(_)));
+        assert!(matches!(err, SchemaError::Validation { .. }));
         let message = err.to_string();
         assert!(message.contains("common.yaml"));
         assert!(message.contains("Big"));
@@ -2377,7 +2432,7 @@ fields:
             prop_assert!(caught.is_ok(), "parse_schema_str panicked for input: {:?}", input);
 
             match caught.expect("already checked is_ok") {
-                Ok(_) | Err(SchemaError::Yaml(_)) | Err(SchemaError::Validation(_)) => {}
+                Ok(_) | Err(SchemaError::Yaml { .. }) | Err(SchemaError::Validation { .. }) => {}
                 Err(other) => prop_assert!(false, "unexpected error variant: {:?}", other),
             }
         }
@@ -2388,7 +2443,7 @@ fields:
             prop_assert!(caught.is_ok(), "validate_schema panicked for schema: {:?}", schema);
 
             match caught.expect("already checked is_ok") {
-                Ok(()) | Err(SchemaError::Validation(_)) => {}
+                Ok(()) | Err(SchemaError::Validation { .. }) => {}
                 Err(other) => prop_assert!(false, "unexpected error variant: {:?}", other),
             }
         }
